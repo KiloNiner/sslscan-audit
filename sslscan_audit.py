@@ -1460,11 +1460,12 @@ def render_csv(hosts: list[HostResult],
             score_cipher  = pr.worst_cipher_strength()
             score_group   = pr.worst_group_strength()
             common = {
-                "target": h.target, "ip": h.ip, "source": h.source,
-                "cname_chain": " -> ".join(h.cname_chain),
+                "target": _csv_safe(h.target), "ip": h.ip, "source": h.source,
+                "cname_chain": _csv_safe(" -> ".join(h.cname_chain)),
                 "port": port, "reachable": pr.reachable,
-                "cert_subject": pr.cert.subject, "cert_issuer": pr.cert.issuer,
-                "cert_sig_algo": pr.cert.signature_algorithm,
+                "cert_subject": _csv_safe(pr.cert.subject),
+                "cert_issuer": _csv_safe(pr.cert.issuer),
+                "cert_sig_algo": _csv_safe(pr.cert.signature_algorithm),
                 "cert_pq_signed": pr.cert.is_pq_signed(),
                 "cert_not_after": pr.cert.not_after, "cert_expired": pr.cert.expired,
                 "heartbleed": ",".join(pr.heartbleed_vulnerable),
@@ -1472,7 +1473,7 @@ def render_csv(hosts: list[HostResult],
                 "reneg_secure": pr.renegotiation_secure,
                 "compression": pr.compression_supported,
                 "fallback_scsv": pr.fallback_supported,
-                "pq_kex_kind": pq_kind, "pq_groups": pq_names,
+                "pq_kex_kind": pq_kind, "pq_groups": _csv_safe(pq_names),
                 "sslscan_overall_strength": score_overall,
                 "sslscan_worst_cipher": score_cipher,
                 "sslscan_worst_group": score_group,
@@ -1487,8 +1488,8 @@ def render_csv(hosts: list[HostResult],
                 continue
             for c in pr.ciphers:
                 w.writerow({**common,
-                    "tls_version": c.protocol, "cipher_suite": c.name,
-                    "bits": c.bits, "kex_curve": c.curve,
+                    "tls_version": c.protocol, "cipher_suite": _csv_safe(c.name),
+                    "bits": c.bits, "kex_curve": _csv_safe(c.curve),
                     "ecdhe_bits": c.ecdhe_bits, "dhe_bits": c.dhe_bits,
                     "strength": c.strength,
                     "issues": "|".join(c.weaknesses()),
@@ -1796,6 +1797,17 @@ HTML_JS = """
 
 def _html_escape(s: str) -> str:
     return _html.escape(s, quote=True) if s else ""
+
+
+_CSV_FORMULA_TRIGGERS = frozenset('=+-@\t\r')
+
+
+def _csv_safe(s: object) -> str:
+    """Prevent spreadsheet formula injection by prefixing trigger characters."""
+    v = str(s) if s is not None else ""
+    if v and v[0] in _CSV_FORMULA_TRIGGERS:
+        return "'" + v
+    return v
 
 
 def _badge_class(strength: str) -> str:
