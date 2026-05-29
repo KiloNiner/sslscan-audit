@@ -55,8 +55,23 @@ import dns.exception
 # Constants & discovery
 # ---------------------------------------------------------------------------
 
-DEFAULT_PORTS = [443, 8443, 465, 993, 995]
+DEFAULT_PORTS = [21, 25, 110, 143, 389, 443, 465, 587, 993, 995, 8443]
 DEFAULT_WORKERS = 20
+
+# Maps well-known STARTTLS ports to the sslscan --starttls-<proto> argument.
+# Any port in this map receives --starttls-<proto> instead of direct TLS.
+# Ports absent from the map (443, 465, 993 …) are treated as implicit TLS.
+STARTTLS_PORTS: dict[int, str] = {
+    21:   "ftp",
+    25:   "smtp",
+    110:  "pop3",
+    143:  "imap",
+    389:  "ldap",
+    587:  "smtp",
+    3306: "mysql",
+    5222: "xmpp",
+    5432: "psql",
+}
 DEFAULT_CONNECT_TIMEOUT = 5   # seconds, passed to sslscan --connect-timeout
 DEFAULT_SOCKET_TIMEOUT  = 5   # seconds, passed to sslscan --timeout
 SUBPROC_TIMEOUT_FACTOR  = 12  # subprocess wall-clock = factor * socket_timeout + 30
@@ -364,6 +379,10 @@ def parse_args() -> argparse.Namespace:
         description="Audit TLS configuration across domains and subnets using sslscan.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    p.add_argument("--host", nargs="+", metavar="HOST",
+                   help="One or more hostnames or IP addresses to scan directly. "
+                        "Hostnames are resolved via DNS (with SNI); bare IPs are "
+                        "scanned without SNI, like --cidr /32 entries.")
     p.add_argument("--cidr", nargs="+", metavar="CIDR",
                    help="One or more subnets in CIDR notation.")
     p.add_argument("--domains", metavar="FILE",
@@ -404,8 +423,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Enable DEBUG logging.")
     args = p.parse_args()
-    if not args.cidr and not args.domains:
-        p.error("at least one of --cidr or --domains is required")
+    if not args.cidr and not args.domains and not args.host:
+        p.error("at least one of --host, --cidr, or --domains is required")
     return args
 
 
@@ -479,6 +498,7 @@ def build_sslscan_cmd(
     socket_timeout: int,
     iana_names: bool,
     show_times: bool,
+    starttls: str | None = None,
 ) -> list[str]:
     """One sslscan invocation against (target_ip, port).
 
@@ -494,6 +514,8 @@ def build_sslscan_cmd(
         f"--timeout={socket_timeout}",
         "--show-certificate",
     ]
+    if starttls:
+        cmd.append(f"--starttls-{starttls}")
     if sni:
         cmd.append(f"--sni-name={sni}")
     if iana_names:
@@ -665,6 +687,7 @@ class Job:
     ip: str
     port: int
     proc_timeout: int
+    starttls: str | None = None
 
 
 def plan_jobs(
@@ -688,16 +711,19 @@ def plan_jobs(
             continue
         for ip in ips:
             for port in ports:
+                starttls = STARTTLS_PORTS.get(port)
                 cmd = build_sslscan_cmd(
                     sslscan,
                     target_ip=ip, port=port, sni=d,
                     connect_timeout=connect_timeout,
                     socket_timeout=socket_timeout,
                     iana_names=iana_names, show_times=show_times,
+                    starttls=starttls,
                 )
                 jobs.append(Job(
                     cmd=cmd, label=f"{d}@{ip}:{port}", source="domain",
                     target=d, ip=ip, port=port, proc_timeout=proc_timeout,
+                    starttls=starttls,
                 ))
 
     # CIDR jobs: one sslscan per (ip, port), no SNI.
@@ -712,16 +738,19 @@ def plan_jobs(
         for ip_obj in hosts:
             ip = str(ip_obj)
             for port in ports:
+                starttls = STARTTLS_PORTS.get(port)
                 cmd = build_sslscan_cmd(
                     sslscan,
                     target_ip=ip, port=port, sni=None,
                     connect_timeout=connect_timeout,
                     socket_timeout=socket_timeout,
                     iana_names=iana_names, show_times=show_times,
+                    starttls=starttls,
                 )
                 jobs.append(Job(
                     cmd=cmd, label=f"{ip}:{port}", source="cidr",
                     target=ip, ip=ip, port=port, proc_timeout=proc_timeout,
+                    starttls=starttls,
                 ))
     return jobs
 
@@ -1284,7 +1313,9 @@ def _md_section_details(reachable: list[HostResult]) -> str:
             if not pr.reachable:
                 continue
 
-            lines.append(f"#### Port {port}\n")
+            starttls = STARTTLS_PORTS.get(port)
+            port_label = f"Port {port}" + (f" (STARTTLS/{starttls.upper()})" if starttls else "")
+            lines.append(f"#### {port_label}\n")
 
             # Protocols table
             lines.append("**Protocols**\n")
@@ -2355,10 +2386,12 @@ def _html_port_block(pr: PortResult) -> str:
             for k, v in rows
         ) + "</tbody></table>"
 
+    starttls = STARTTLS_PORTS.get(pr.port)
+    port_label = f"Port {pr.port}" + (f" (STARTTLS/{starttls.upper()})" if starttls else "")
     return f"""
 <details class="port collapsible" open>
   <summary>
-    <strong>Port {pr.port}</strong>
+    <strong>{_html_escape(port_label)}</strong>
     {_badge_html(pr.overall_strength())}
     {_pq_kind_badge(pr.pq_kex_kind())}
   </summary>
@@ -2417,8 +2450,18 @@ def main() -> int:
     # below after orchestration so duration_s is real.
     run_meta = collect_run_metadata(args, sslscan, started.isoformat())
 
-    domains = load_domains(args.domains) if args.domains else []
-    cidrs = args.cidr or []
+    # Split --host values: bare IPs become /32 CIDRs; everything else is a domain.
+    cli_domains: list[str] = []
+    cli_cidrs: list[str] = []
+    for h in (args.host or []):
+        try:
+            ipaddress.ip_address(h)
+            cli_cidrs.append(f"{h}/32")
+        except ValueError:
+            cli_domains.append(h)
+
+    domains = cli_domains + (load_domains(args.domains) if args.domains else [])
+    cidrs = cli_cidrs + (args.cidr or [])
 
     log.info("Resolving DNS for %d domain(s) …", len(domains))
     domain_meta = resolve_all_domains(domains)
