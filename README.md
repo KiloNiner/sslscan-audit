@@ -50,11 +50,31 @@ At least one of `--cidr` or `--domains` is required.
 
 ### Targets
 
+At least one of `--host`, `--cidr`, or `--domains` is required; they may be combined freely.
+
 | Flag | Description |
 | --- | --- |
-| `--cidr CIDR [CIDR ...]` | One or more subnets in CIDR notation (e.g. `10.0.0.0/24 192.168.1.0/28`). Every host in each subnet is scanned. |
+| `--host HOST [HOST ...]` | One or more hostnames or IP addresses to scan directly. Hostnames are resolved via DNS (CNAME chains followed, SNI set); bare IP addresses are scanned without SNI, equivalent to a `/32` CIDR entry. |
+| `--cidr CIDR [CIDR ...]` | One or more subnets in CIDR notation (e.g. `10.0.0.0/24 192.168.1.0/28`). Every host in each subnet is scanned without SNI. |
 | `--domains FILE` | Path to a file with one domain per line. Blank lines and lines starting with `#` are ignored. Each domain is resolved via DNS (CNAME chains are followed). |
-| `--ports PORT [PORT ...]` | TLS ports to probe. Default: `443 8443 465 993 995`. |
+| `--ports PORT [PORT ...]` | Ports to probe. Default: `21 25 110 143 389 443 465 587 993 995 8443`. Ports with a well-known STARTTLS mapping (see below) automatically receive `--starttls-<proto>`; all others are treated as implicit TLS. |
+
+### STARTTLS port mapping
+
+The following ports automatically trigger the corresponding `--starttls-<proto>` sslscan flag.
+Any other port (443, 465, 993, …) is treated as direct / implicit TLS.
+
+| Port | Protocol | sslscan flag |
+| --- | --- | --- |
+| 21 | FTP | `--starttls-ftp` |
+| 25 | SMTP | `--starttls-smtp` |
+| 110 | POP3 | `--starttls-pop3` |
+| 143 | IMAP | `--starttls-imap` |
+| 389 | LDAP | `--starttls-ldap` |
+| 587 | SMTP submission | `--starttls-smtp` |
+| 3306 | MySQL | `--starttls-mysql` |
+| 5222 | XMPP client | `--starttls-xmpp` |
+| 5432 | PostgreSQL | `--starttls-psql` |
 
 ### sslscan tuning
 
@@ -94,6 +114,18 @@ fail (exit code `1`) until they are fixed:
 | `2` | Execution error (sslscan missing, fatal exception, etc.). `130` if interrupted with Ctrl-C. |
 
 ## Examples
+
+Scan a single host directly:
+
+```bash
+sslscan_audit.py --host mail.example.com
+```
+
+Scan a mix of hostnames and IPs on the command line:
+
+```bash
+sslscan_audit.py --host mail.example.com smtp.example.com 10.0.0.5
+```
 
 Scan a single domain list, write a Markdown report to stdout:
 
