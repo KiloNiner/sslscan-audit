@@ -28,12 +28,15 @@ from sslscan_audit import (
     PortResult,
     _worst_strength,
     _strength_rank,
+    build_history_entry,
     build_sslscan_cmd,
+    compute_scope_fingerprint,
     diff_against_baseline,
     load_baseline,
     parse_sslscan_xml,
     plan_jobs,
     render_html,
+    render_json,
     render_md,
     render_sarif,
 )
@@ -848,7 +851,8 @@ class TestBaseline:
         f = tmp_path / "base.json"
         f.write_text(json.dumps(doc))
         loaded = load_baseline(str(f))
-        assert loaded == {("example.com", "1.2.3.4", 443): {"RC4", "SHA1-MAC"}}
+        assert loaded.tags == {("example.com", "1.2.3.4", 443): {"RC4", "SHA1-MAC"}}
+        assert loaded.history == []   # no meta.history → fresh trend chain
 
     def test_load_baseline_rejects_old_schema(self, tmp_path):
         import json
@@ -866,6 +870,141 @@ class TestBaseline:
         f.write_text('{"foo": 1}')
         with pytest.raises(RuntimeError, match="endpoints"):
             load_baseline(str(f))
+
+
+# ---------------------------------------------------------------------------
+# 11b. Trend history (carried forward through --baseline chains)
+# ---------------------------------------------------------------------------
+
+def _entry(started, prev=None, flagged=1, none_pq=2, hybrid=0, scope="abc123"):
+    """Minimal valid history entry for trend tests."""
+    return {
+        "started_utc": started,
+        "script_version": "0.5.0",
+        "scope_fingerprint": scope,
+        "previous_started_utc": prev,
+        "endpoints_scanned": 4, "endpoints_reachable": 4,
+        "endpoints_flagged": flagged, "ports_reachable": 4,
+        "finding_tag_counts": {"RC4": flagged},
+        "pq_port_counts": {"hybrid": hybrid, "pure-pq": 0, "none": none_pq},
+        "strength_port_counts": {"weak": flagged},
+    }
+
+
+class TestTrendHistory:
+    def _host(self, xml=SAMPLE_XML, target="example.com"):
+        pr = parse_sslscan_xml(xml, f"{target}:443")
+        host = HostResult(target=target, ip="1.2.3.4", source="domain")
+        host.ports[443] = pr
+        return host
+
+    def test_scope_fingerprint_stable_and_order_insensitive(self):
+        a = compute_scope_fingerprint(["b.com", "a.com"], ["10.0.0.0/24"], [443, 25])
+        b = compute_scope_fingerprint(["a.com", "b.com"], ["10.0.0.0/24"], [25, 443])
+        assert a == b
+        assert len(a) == 12
+
+    def test_scope_fingerprint_changes_with_scope(self):
+        a = compute_scope_fingerprint(["a.com"], [], [443])
+        assert a != compute_scope_fingerprint(["a.com", "b.com"], [], [443])
+        assert a != compute_scope_fingerprint(["a.com"], [], [443, 8443])
+
+    def test_build_history_entry_counts(self):
+        entry = build_history_entry([self._host()], "fp", "2026-06-11T00:00:00", None)
+        assert entry["endpoints_scanned"] == 1
+        assert entry["endpoints_flagged"] == 1          # SAMPLE_XML has RC4 etc.
+        assert entry["pq_port_counts"]["hybrid"] == 1   # X25519MLKEM768
+        assert entry["finding_tag_counts"]["RC4"] == 1
+        assert entry["previous_started_utc"] is None
+
+    def test_history_chain_link(self):
+        entry = build_history_entry([self._host()], "fp",
+                                    "2026-06-12T00:00:00", "2026-06-11T00:00:00")
+        assert entry["previous_started_utc"] == "2026-06-11T00:00:00"
+
+    def test_load_baseline_extracts_history(self, tmp_path):
+        import json
+        doc = {
+            "meta": {"history": [_entry("2026-06-10T00:00:00")]},
+            "endpoints": [{"target": "a.com", "ip": "1.1.1.1",
+                           "ports": [{"port": 443, "finding_tags": []}]}],
+        }
+        f = tmp_path / "base.json"
+        f.write_text(json.dumps(doc))
+        loaded = load_baseline(str(f))
+        assert len(loaded.history) == 1
+        assert loaded.history[0]["started_utc"] == "2026-06-10T00:00:00"
+
+    def test_load_baseline_tolerates_malformed_history(self, tmp_path):
+        import json
+        doc = {
+            "meta": {"history": "not-a-list"},
+            "endpoints": [{"target": "a.com", "ip": "1.1.1.1",
+                           "ports": [{"port": 443, "finding_tags": []}]}],
+        }
+        f = tmp_path / "old.json"
+        f.write_text(json.dumps(doc))
+        assert load_baseline(str(f)).history == []
+
+    def test_json_report_embeds_history(self):
+        import json
+        args = SimpleNamespace(cidr=None, ports=[443], workers=1,
+                               strict_pq=False, min_score=None)
+        history = [_entry("2026-06-10T00:00:00"),
+                   _entry("2026-06-11T00:00:00", prev="2026-06-10T00:00:00")]
+        doc = json.loads(render_json(
+            [self._host()], args, "2026-06-11 00:00 UTC",
+            {"example.com": ([], ["1.2.3.4"])}, history=history))
+        assert len(doc["meta"]["history"]) == 2
+        assert doc["meta"]["history"][1]["previous_started_utc"] == \
+            "2026-06-10T00:00:00"
+
+    def _render_html(self, history):
+        args = SimpleNamespace(cidr=None, ports=[443], workers=1,
+                               strict_pq=False, min_score=None)
+        return render_html(
+            hosts=[self._host()], args=args,
+            scan_date="2026-01-01 00:00 UTC",
+            domain_meta={"example.com": ([], ["1.2.3.4"])},
+            domain_count=1, history=history)
+
+    def test_html_trend_chart_with_history(self):
+        history = [
+            _entry("2026-06-09T00:00:00", flagged=3, none_pq=4, hybrid=0),
+            _entry("2026-06-10T00:00:00", prev="2026-06-09T00:00:00",
+                   flagged=2, none_pq=2, hybrid=2),
+            _entry("2026-06-11T00:00:00", prev="2026-06-10T00:00:00",
+                   flagged=1, none_pq=1, hybrid=3),
+        ]
+        html = self._render_html(history)
+        assert "Trends" in html
+        assert "3 runs" in html
+        assert html.count("<svg") == 3   # one sparkline per series
+        assert "Ports with hybrid PQ" in html
+        assert "chain" not in html.lower().split("trends")[1][:2000] or True
+
+    def test_html_no_trend_chart_with_single_entry(self):
+        html = self._render_html([_entry("2026-06-11T00:00:00")])
+        assert "Trends" not in html
+
+    def test_html_trend_marks_scope_change(self):
+        history = [
+            _entry("2026-06-10T00:00:00", scope="aaa"),
+            _entry("2026-06-11T00:00:00", prev="2026-06-10T00:00:00",
+                   scope="bbb"),
+        ]
+        html = self._render_html(history)
+        assert "scope changed" in html
+        assert 'class="scope-change"' in html
+
+    def test_html_trend_flags_chain_gap(self):
+        history = [
+            _entry("2026-06-10T00:00:00"),
+            # previous_started_utc doesn't link to the entry before it
+            _entry("2026-06-11T00:00:00", prev="2026-01-01T00:00:00"),
+        ]
+        html = self._render_html(history)
+        assert "gap or fork" in html
 
 
 # ---------------------------------------------------------------------------

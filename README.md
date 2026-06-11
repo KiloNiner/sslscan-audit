@@ -148,7 +148,37 @@ fail (exit code `1`) until they are fixed:
 | `--strict-pq-hybrid` | Like `--strict-pq`, but require a *hybrid* (PQ + classical) group specifically — endpoints offering only pure-PQ groups are also flagged. |
 | `--min-score LABEL` | Treat any endpoint scored below `LABEL` as a finding. Choices, worst → best: `null`, `anonymous`, `weak`, `medium`, `acceptable`, `good`, `strong`. |
 | `--fail-on TAG [TAG ...]` | Restrict the exit-code gate to specific finding tags (comma- or space-separated, case-insensitive). Reports still show every finding; only the named tags flag endpoints and drive exit code `1`. Naming `NO-PQ` or `NO-PQ-HYBRID` activates that PQ gate implicitly, so `--fail-on NO-PQ-HYBRID` alone gives you a CI run that fails *only* on missing hybrid PQ support. |
-| `--baseline FILE` | Diff against a previous JSON report (`--format json`, script ≥ 0.5.0): exit `1` only if an endpoint:port shows a finding tag that wasn't in the baseline (a regression). Pre-existing findings are still reported but don't fail the run — ideal for ratcheting a fleet toward a target posture without a big-bang cleanup. |
+| `--baseline FILE` | Diff against a previous JSON report (`--format json`, script ≥ 0.5.0): exit `1` only if an endpoint:port shows a finding tag that wasn't in the baseline (a regression). Pre-existing findings are still reported but don't fail the run — ideal for ratcheting a fleet toward a target posture without a big-bang cleanup. Also carries the baseline's trend history forward (see below). |
+
+### Trend history
+
+Every JSON report embeds a `meta.history` array: the baseline's history plus
+one compact summary entry (~300 bytes) for the current run — timestamp,
+endpoint/port counts, per-tag finding counts, PQ posture counts, strength
+distribution, a scope fingerprint, and a chain link to the previous run. As
+long as each run passes the *newest* report via `--baseline`, the latest
+report accumulates the whole fleet-level time series; no other files need to
+be retained (capped at the most recent 365 entries).
+
+When the history holds two or more runs, the HTML report adds a **Trends**
+chart (flagged endpoints, no-PQ ports, hybrid-PQ ports over time). Two
+integrity guards keep the chart honest:
+
+* **Scope changes** — each entry fingerprints the scanned targets+ports;
+  points where the fingerprint changed render hollow, since counts either
+  side aren't comparable.
+* **Chain gaps** — each entry records the `started_utc` of its baseline; if
+  an entry doesn't link to its predecessor (forked or hand-edited chain),
+  the chart flags it. Running without `--baseline` starts a fresh chain.
+
+The practical CI shape is a ratchet:
+
+```bash
+sslscan_audit.py --domains targets.txt --format json html --output this \
+  --baseline last.json
+# on success (exit 0 = no regressions), promote the new report:
+mv this.json last.json
+```
 
 ### Finding tags
 

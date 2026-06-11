@@ -64,7 +64,9 @@ parse_args()
 
 **Finding-tag taxonomy:** `KNOWN_FINDING_TAGS` is the canonical vocabulary shared by `--fail-on` validation, the JSON/CSV `finding_tags` fields, SARIF rule IDs (`SARIF_RULE_META`), and baseline diffing. Adding a new weakness check means adding its tag here and to `SARIF_RULE_META`.
 
-**Baseline diffing:** `load_baseline()` only accepts JSON reports that carry per-port `finding_tags` (script ≥ 0.5.0) and fails loudly otherwise. `diff_against_baseline()` treats unknown endpoints as fully new, ignores disappeared endpoints, and respects `FAIL_ON`.
+**Baseline diffing:** `load_baseline()` returns a `Baseline` (per-port tag map + trend history) and only accepts JSON reports that carry per-port `finding_tags` (script ≥ 0.5.0), failing loudly otherwise. `diff_against_baseline()` treats unknown endpoints as fully new, ignores disappeared endpoints, and respects `FAIL_ON`.
+
+**Trend history:** each JSON report embeds `meta.history` = baseline history + one `build_history_entry()` summary for the current run (aggregates only, never per-port data), capped at `MAX_HISTORY_ENTRIES`. Entries carry a `scope_fingerprint` (`compute_scope_fingerprint()`) and a `previous_started_utc` chain link; the HTML Trends chart (`_chart_trend()`, rendered when history ≥ 2) marks scope changes (hollow points) and chain gaps. A malformed/missing history in a baseline is tolerated — the chain restarts.
 
 **Subprocess timeout:** `proc_timeout = socket_timeout * SUBPROC_TIMEOUT_FACTOR + 30` — a hard wall-clock limit passed to `subprocess.run(timeout=…)`. This prevents stalled sslscan processes from blocking the thread pool indefinitely.
 

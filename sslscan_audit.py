@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import ipaddress
 import json
@@ -111,6 +112,12 @@ PORT_FINDING_TAGS = frozenset({
 GATE_FINDING_TAGS = frozenset({"NO-PQ", "NO-PQ-HYBRID", "BELOW-MIN-SCORE"})
 KNOWN_FINDING_TAGS = (CIPHER_FINDING_TAGS | CERT_FINDING_TAGS
                       | PORT_FINDING_TAGS | GATE_FINDING_TAGS)
+
+# Trend history carried forward through --baseline chains: each JSON report
+# embeds the baseline's history plus one summary entry for its own run, so a
+# single file accumulates a fleet-level time series (~300 bytes per entry).
+# Capped so a long-running daily chain can't grow a report without bound.
+MAX_HISTORY_ENTRIES = 365
 
 # Cipher-name regex tags. sslscan reports OpenSSL names like
 #   ECDHE-RSA-AES128-SHA  or  AES256-SHA256
@@ -946,15 +953,25 @@ def run_all_jobs(
 
 
 # ---------------------------------------------------------------------------
-# Baseline / regression diffing
+# Baseline / regression diffing & trend history
 # ---------------------------------------------------------------------------
 
-def load_baseline(path: str) -> dict[tuple[str, str, int], set[str]]:
-    """Parse a previous JSON report into {(target, ip, port): finding_tags}.
+@dataclass
+class Baseline:
+    """Everything we extract from a previous JSON report: the per-port tag
+    map used for regression gating, and the accumulated trend history that
+    is carried forward into this run's report."""
+    tags: dict[tuple[str, str, int], set[str]]
+    history: list[dict] = field(default_factory=list)
 
-    Requires a report produced by --format json with script ≥ 0.5.0 (the
-    first version that records per-port finding_tags); older reports can't
-    be diffed reliably, so we fail loudly rather than guess."""
+
+def load_baseline(path: str) -> Baseline:
+    """Parse a previous JSON report produced by --format json.
+
+    Requires script ≥ 0.5.0 (the first version that records per-port
+    finding_tags); older reports can't be diffed reliably, so we fail
+    loudly rather than guess.  A missing/foreign meta.history is tolerated
+    (the trend chain simply starts with the current run)."""
     try:
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
@@ -965,16 +982,68 @@ def load_baseline(path: str) -> dict[tuple[str, str, int], set[str]]:
         raise RuntimeError(
             f"Baseline {path!r} is not a sslscan_audit JSON report "
             "(missing 'endpoints' array).")
-    out: dict[tuple[str, str, int], set[str]] = {}
+    tags: dict[tuple[str, str, int], set[str]] = {}
     for ep in endpoints:
         for p in ep.get("ports", []):
             if "finding_tags" not in p:
                 raise RuntimeError(
                     f"Baseline {path!r} predates per-port finding_tags "
                     "(script < 0.5.0) — regenerate it with --format json.")
-            out[(ep.get("target", ""), ep.get("ip", ""), p.get("port", 0))] = \
+            tags[(ep.get("target", ""), ep.get("ip", ""), p.get("port", 0))] = \
                 set(p["finding_tags"])
-    return out
+    history = doc.get("meta", {}).get("history")
+    if not isinstance(history, list) or not all(
+            isinstance(e, dict) for e in history):
+        if history:
+            log.warning("Baseline %s has a malformed meta.history — "
+                        "starting a fresh trend chain", path)
+        history = []
+    return Baseline(tags=tags, history=history)
+
+
+def compute_scope_fingerprint(domains: list[str], cidrs: list[str],
+                              ports: list[int]) -> str:
+    """Short stable hash of the scanned scope.  Trend points whose scope
+    differs aren't comparable (counts move because the target set moved,
+    not because the fleet changed), so the chart marks fingerprint changes."""
+    blob = "\n".join(sorted(set(domains)) + sorted(set(cidrs))) \
+        + "\n" + ",".join(str(p) for p in sorted(set(ports)))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def build_history_entry(
+    hosts: list["HostResult"],
+    scope_fingerprint: str,
+    started_utc_iso: str,
+    previous_started_utc: str | None,
+) -> dict:
+    """One compact trend-history entry summarising this run.  Aggregates
+    only — full per-port data lives in the report body, not the history
+    (embedding snapshots would bloat every successive report)."""
+    ports = [pr for h in hosts for pr in h.reachable_ports()]
+    tag_counts = Counter(t for pr in ports for t in pr.finding_tags())
+    pq = Counter(pr.pq_kex_kind() for pr in ports)
+    strength = Counter((pr.overall_strength() or "unknown").lower()
+                       for pr in ports)
+    return {
+        "started_utc": started_utc_iso,
+        "script_version": SCRIPT_VERSION,
+        "scope_fingerprint": scope_fingerprint,
+        # Chain link: the started_utc of the run we used as --baseline.
+        # A mismatch with the preceding entry exposes a forked/edited chain.
+        "previous_started_utc": previous_started_utc,
+        "endpoints_scanned": len(hosts),
+        "endpoints_reachable": sum(1 for h in hosts if h.reachable_ports()),
+        "endpoints_flagged": sum(1 for h in hosts if h.has_findings()),
+        "ports_reachable": len(ports),
+        "finding_tag_counts": dict(sorted(tag_counts.items())),
+        "pq_port_counts": {
+            "hybrid": pq.get("hybrid", 0),
+            "pure-pq": pq.get("pure-pq", 0),
+            "none": pq.get("none", 0),
+        },
+        "strength_port_counts": {k: strength[k] for k in sorted(strength)},
+    }
 
 
 def diff_against_baseline(
@@ -1764,6 +1833,7 @@ def render_json(
     scan_date: str,
     domain_meta: dict[str, tuple[list[str], list[str]]],
     run_meta: "RunMetadata | None" = None,
+    history: "list[dict] | None" = None,
 ) -> str:
     # Strength-score rollup at the fleet level
     score_rollup: dict[str, int] = {b: 0 for b in STRENGTH_BUCKETS}
@@ -1789,6 +1859,10 @@ def render_json(
             # Embedded run-metadata: provenance for reproducibility.
             # Consumers wanting just the scan results can ignore meta.run.
             "run": (run_meta.as_dict() if run_meta is not None else None),
+            # Trend history: the baseline's history plus this run's summary
+            # entry, carried forward through --baseline chains so the newest
+            # report holds the whole fleet-level time series.
+            "history": history or [],
         },
         "endpoints": [],
     }
@@ -2193,6 +2267,21 @@ details.port { background: var(--bg-3); }
 .cs-hybrid     { background: #3fb950; }
 .cs-purepq     { background: #d29922; }
 .cs-nopq       { background: #f85149; }
+/* trend sparklines */
+.trend-row { display: flex; align-items: center; gap: .5rem; margin: .35rem 0; }
+.trend-label { flex: 0 0 10.5rem; text-align: right; font-size: .82rem;
+  color: var(--fg-dim); }
+.trend-last { flex: 0 0 2.6rem; font-size: .82rem; }
+.spark { flex: 1; height: 44px; min-width: 0; }
+.spark polyline { fill: none; stroke-width: 2; }
+.spark circle.scope-change { stroke-width: 2; fill: var(--bg-2); }
+.spark-good polyline { stroke: #3fb950; }
+.spark-good circle   { fill: #3fb950; stroke: #3fb950; }
+.spark-mid polyline  { stroke: #d29922; }
+.spark-mid circle    { fill: #d29922; stroke: #d29922; }
+.spark-bad polyline  { stroke: #f85149; }
+.spark-bad circle    { fill: #f85149; stroke: #f85149; }
+.trend-note { font-size: .78rem; color: var(--fg-dim); margin-top: .4rem; }
 
 .no-results { color: var(--fg-dim); font-style: italic; padding: .75rem 0; }
 .footer { color: var(--fg-dim); font-size: .82rem;
@@ -2288,7 +2377,93 @@ def _chart_stacked_bar(segments: list[tuple[str, int, str]]) -> str:
             f'<div class="legend">{legend}</div>')
 
 
-def _html_section_charts(reachable: list[HostResult]) -> str:
+def _svg_sparkline(points: list[tuple[str, float, bool]], cls: str) -> str:
+    """Inline-SVG sparkline from [(tooltip, value, scope_changed)].
+    Pure SVG — no JS — with per-point <title> tooltips; scope-change points
+    render hollow so a discontinuity in scanned scope is visible."""
+    w, h, pad = 260, 44, 5
+    vals = [v for _, v, _ in points]
+    vmax = max(vals) or 1.0
+    n = len(points)
+
+    def xs(i: int) -> float:
+        return pad + i * (w - 2 * pad) / max(n - 1, 1)
+
+    def ys(v: float) -> float:
+        return h - pad - (v / vmax) * (h - 2 * pad)
+
+    poly = " ".join(f"{xs(i):.1f},{ys(v):.1f}"
+                    for i, (_, v, _) in enumerate(points))
+    circles = "".join(
+        f'<circle cx="{xs(i):.1f}" cy="{ys(v):.1f}" r="2.5"'
+        + (' class="scope-change"' if changed else "")
+        + f'><title>{_html_escape(tip)}</title></circle>'
+        for i, (tip, v, changed) in enumerate(points)
+    )
+    return (f'<svg class="spark {cls}" viewBox="0 0 {w} {h}" '
+            f'preserveAspectRatio="none" role="img">'
+            f'<polyline points="{poly}"/>{circles}</svg>')
+
+
+def _chart_trend(history: list[dict] | None) -> str:
+    """Trend card from the carried-forward history.  Needs ≥ 2 entries —
+    a single run is a snapshot, not a trend."""
+    if not history or len(history) < 2:
+        return ""
+
+    # Per-entry annotations: scope changes and chain gaps.
+    scope_changed = [False]
+    chain_gap = False
+    for prev, cur in zip(history, history[1:]):
+        scope_changed.append(
+            cur.get("scope_fingerprint") != prev.get("scope_fingerprint"))
+        if cur.get("previous_started_utc") != prev.get("started_utc"):
+            chain_gap = True
+
+    def series(label: str, cls: str, getter) -> str:
+        pts = []
+        for i, e in enumerate(history):
+            v = float(getter(e) or 0)
+            tip = f"{e.get('started_utc', '')[:16]}: {v:g}"
+            if scope_changed[i]:
+                tip += " (scope changed)"
+            pts.append((tip, v, scope_changed[i]))
+        last = pts[-1][1]
+        return (f'<div class="trend-row">'
+                f'<span class="trend-label">{_html_escape(label)}</span>'
+                f'{_svg_sparkline(pts, cls)}'
+                f'<span class="trend-last">{last:g}</span></div>')
+
+    rows = (
+        series("Flagged endpoints", "spark-bad",
+               lambda e: e.get("endpoints_flagged"))
+        + series("Ports with no PQ KEX", "spark-mid",
+                 lambda e: e.get("pq_port_counts", {}).get("none"))
+        + series("Ports with hybrid PQ", "spark-good",
+                 lambda e: e.get("pq_port_counts", {}).get("hybrid"))
+    )
+
+    notes = []
+    if any(scope_changed):
+        notes.append("hollow points mark a changed scan scope — counts "
+                     "either side are not directly comparable")
+    if chain_gap:
+        notes.append("⚠ history chain has a gap or fork (an entry does not "
+                     "link to its predecessor)")
+    note_html = (f'<p class="trend-note">{_html_escape("; ".join(notes))}</p>'
+                 if notes else "")
+    first = history[0].get("started_utc", "")[:10]
+    last_d = history[-1].get("started_utc", "")[:10]
+    return f"""
+  <div class="chart">
+    <h4>Trends <span class="chart-sub">({len(history)} runs, {_html_escape(first)} → {_html_escape(last_d)})</span></h4>
+    {rows}
+    {note_html}
+  </div>"""
+
+
+def _html_section_charts(reachable: list[HostResult],
+                         history: list[dict] | None = None) -> str:
     """'At a glance' strip at the top of the HTML report: PQ readiness,
     strength distribution, and the most frequent finding tags."""
     ports = [pr for h in reachable for pr in h.reachable_ports()]
@@ -2350,6 +2525,7 @@ def _html_section_charts(reachable: list[HostResult]) -> str:
         <span class="chart-sub">(occurrences across ports)</span></h4>
     {findings_chart}
   </div>
+{_chart_trend(history)}
 </div>
 """
 
@@ -2361,6 +2537,7 @@ def render_html(
     domain_meta: dict[str, tuple[list[str], list[str]]],
     domain_count: int,
     run_meta: "RunMetadata | None" = None,
+    history: "list[dict] | None" = None,
 ) -> str:
     reachable = [h for h in hosts if h.reachable_ports()]
     flagged   = [h for h in reachable if h.has_findings()]
@@ -2404,7 +2581,7 @@ def render_html(
 </div>
 """)
 
-    parts.append(_html_section_charts(reachable))
+    parts.append(_html_section_charts(reachable, history))
     if run_meta is not None:
         parts.append(_html_section_run_metadata(run_meta))
     parts.append(_html_section_context())
@@ -2919,16 +3096,18 @@ def _html_port_block(pr: PortResult) -> str:
 # ---------------------------------------------------------------------------
 
 def render_one(fmt, hosts, args, scan_date, domain_meta, domain_count,
-               run_meta: "RunMetadata | None" = None) -> str:
+               run_meta: "RunMetadata | None" = None,
+               history: "list[dict] | None" = None) -> str:
     if fmt == "csv":
         return render_csv(hosts, run_meta=run_meta)
     if fmt == "sarif":
         return render_sarif(hosts, run_meta=run_meta)
     if fmt == "json":
-        return render_json(hosts, args, scan_date, domain_meta, run_meta=run_meta)
+        return render_json(hosts, args, scan_date, domain_meta,
+                           run_meta=run_meta, history=history)
     if fmt == "html":
         return render_html(hosts, args, scan_date, domain_meta, domain_count,
-                           run_meta=run_meta)
+                           run_meta=run_meta, history=history)
     return render_md(hosts, args, scan_date, domain_meta, domain_count,
                      run_meta=run_meta)
 
@@ -3014,7 +3193,7 @@ def main() -> int:
 
     regressions = None
     if baseline is not None:
-        regressions = diff_against_baseline(baseline, hosts)
+        regressions = diff_against_baseline(baseline.tags, hosts)
         if regressions:
             log.warning("%d regression(s) versus baseline %s:",
                         len(regressions), args.baseline)
@@ -3026,10 +3205,21 @@ def main() -> int:
                      "(%d pre-existing finding endpoint(s) ignored).",
                      args.baseline, n_flagged)
 
+    # Trend history: carry the baseline's history forward and append one
+    # summary entry for this run.  Without --baseline a fresh chain starts.
+    prev_history = baseline.history if baseline is not None else []
+    entry = build_history_entry(
+        hosts,
+        compute_scope_fingerprint(domains, cidrs, args.ports),
+        started.isoformat(),
+        prev_history[-1].get("started_utc") if prev_history else None,
+    )
+    history = (prev_history + [entry])[-MAX_HISTORY_ENTRIES:]
+
     formats: list[str] = args.format
     kwargs = dict(hosts=hosts, args=args, scan_date=scan_date,
                   domain_meta=domain_meta, domain_count=len(domains),
-                  run_meta=run_meta)
+                  run_meta=run_meta, history=history)
 
     if len(formats) == 1:
         report = render_one(formats[0], **kwargs)
