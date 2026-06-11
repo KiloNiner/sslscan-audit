@@ -23,8 +23,10 @@ cipher suites via nmap NSE, this tool drives `sslscan --xml=-` against every
 XML parsing is exact — no scraping of human-readable sslscan output.
 
 Usage:
-  sslscan_audit.py [--cidr CIDR ...] [--domains FILE] [--ports PORT ...] \\
-                   [--workers N] [--format md csv json] [--output STEM]
+  sslscan_audit.py [--host HOST ...] [--cidr CIDR ...] [--domains FILE] \\
+                   [--ports PORT ...] [--workers N] \\
+                   [--strict-pq] [--min-score LABEL] \\
+                   [--format md csv json html] [--output STEM]
 """
 
 from __future__ import annotations
@@ -77,7 +79,7 @@ DEFAULT_SOCKET_TIMEOUT  = 5   # seconds, passed to sslscan --timeout
 SUBPROC_TIMEOUT_FACTOR  = 12  # subprocess wall-clock = factor * socket_timeout + 30
 
 # Tool version — bump when the report schema or scoring logic changes.
-SCRIPT_VERSION = "0.3.0"
+SCRIPT_VERSION = "0.4.0"
 
 # Mutable runtime config (set in main() so we don't have to plumb it through
 # every helper).  STRICT_PQ promotes "no PQ key-exchange" to a finding;
@@ -98,13 +100,17 @@ RE_DES    = re.compile(r"\bDES\b|3DES|DES-CBC3", re.I)
 RE_EXPORT = re.compile(r"EXP(?:ORT)?", re.I)
 RE_NULL   = re.compile(r"(?:^|[-_])NULL(?:[-_]|$)", re.I)
 RE_ANON   = re.compile(r"(?:^|[-_])(?:ADH|AECDH|anon)(?:[-_]|$)", re.I)
-RE_NO_PFS = re.compile(r"^(?:AES|RSA|DES|RC4|CAMELLIA|ARIA)")   # cipher starts with bulk-only → RSA kex, no PFS
+# No forward secrecy: OpenSSL names starting with the bulk cipher imply
+# static-RSA key exchange; IANA names spell it out as TLS_RSA_(EXPORT_)WITH_….
+RE_NO_PFS = re.compile(r"^(?:AES|RSA|DES|RC4|CAMELLIA|ARIA)|^TLS_RSA_")
 
 # Post-Quantum (PQ) key-exchange group detector.
 # Matches IANA-registered hybrid + pure-PQ named groups that sslscan reports
 # in TLS 1.3 (and a few pre-standard codepoints still seen in the wild):
-#   * X25519MLKEM768            (IANA 0x11EC — RFC 9606 hybrid, the upcoming standard)
+#   * X25519MLKEM768            (IANA 0x11EC, draft-ietf-tls-ecdhe-mlkem — the
+#                                hybrid that browsers and CDNs deploy by default)
 #   * SecP256r1MLKEM768         (IANA 0x11EB)
+#   * SecP384r1MLKEM1024        (IANA 0x11ED)
 #   * MLKEM512 / MLKEM768 / MLKEM1024 (pure ML-KEM, FIPS 203)
 #   * X25519Kyber768Draft00     (0x6399, Cloudflare/Google deployment from 2022-2024)
 #   * SecP256r1Kyber768Draft00  (0x639A)
@@ -121,6 +127,12 @@ RE_PQ_SIG = re.compile(
     r"(?:ML-?DSA|SLH-?DSA|Dilithium|SPHINCS|Falcon|FN-?DSA)",
     re.I,
 )
+
+# Weak X.509 signature digests (certificate-level, distinct from cipher-suite
+# MACs): sha1WithRSAEncryption, ecdsa-with-SHA1, md5WithRSAEncryption, …
+# The negative lookahead keeps sha256/sha384/sha512 from matching.
+RE_CERT_SHA1 = re.compile(r"sha-?1(?!\d)", re.I)
+RE_CERT_MD   = re.compile(r"\bmd[245]", re.I)
 
 # sslscan strength labels in ascending order of safety.
 # Used to compute a per-port "worst observed strength" — analogous to an
@@ -196,9 +208,11 @@ class Cipher:
         if RE_EXPORT.search(n):  tags.append("EXPORT")
         if RE_DES.search(n):     tags.append("DES/3DES")
         if RE_RC4.search(n):     tags.append("RC4")
-        if RE_SHA1.search(n) and not n.startswith("TLS_"):
-            # TLS 1.3 IANA suites end in _SHA256/_SHA384 — exclude false matches by
-            # requiring non-IANA prefix; the regex already enforces "_SHA$"/"-SHA$".
+        if RE_SHA1.search(n):
+            # The regex anchors on a bare "_SHA"/"-SHA" suffix, so TLS 1.3
+            # suites (…_SHA256/_SHA384) never match — no prefix guard needed.
+            # (A "TLS_" prefix guard here would silently disable SHA-1
+            # detection for every suite when --iana-names is in effect.)
             tags.append("SHA1-MAC")
         if RE_CBC.search(n) and self.protocol in {"TLSv1.0", "TLSv1.1"}:
             tags.append("CBC-OLD-TLS")
@@ -245,6 +259,20 @@ class Certificate:
         """True if the cert is signed with a post-quantum signature algorithm
         (ML-DSA, SLH-DSA, Falcon, etc. — including pre-standard names)."""
         return bool(RE_PQ_SIG.search(self.signature_algorithm or ""))
+
+    def weaknesses(self) -> list[str]:
+        """Certificate-level findings: expiry and weak signature digests.
+        Self-signed is reported but not flagged — it is routine on internal
+        fleets and a policy question rather than a cryptographic weakness."""
+        tags: list[str] = []
+        if self.expired == "true":
+            tags.append("EXPIRED")
+        sig = self.signature_algorithm or ""
+        if RE_CERT_SHA1.search(sig):
+            tags.append("SHA1-SIGNATURE")
+        if RE_CERT_MD.search(sig):
+            tags.append("MD5-SIGNATURE")
+        return tags
 
 
 @dataclass
@@ -325,6 +353,7 @@ class PortResult:
         base = (
             bool(self.weak_protocols())
             or bool(self.weak_ciphers())
+            or bool(self.cert.weaknesses())
             or bool(self.heartbleed_vulnerable)
             or self.compression_supported == "1"
             or (self.renegotiation_supported == "1" and self.renegotiation_secure == "0")
@@ -382,7 +411,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--host", nargs="+", metavar="HOST",
                    help="One or more hostnames or IP addresses to scan directly. "
                         "Hostnames are resolved via DNS (with SNI); bare IPs are "
-                        "scanned without SNI, like --cidr /32 entries.")
+                        "scanned without SNI, like single-address --cidr entries "
+                        "(/32 for IPv4, /128 for IPv6).")
     p.add_argument("--cidr", nargs="+", metavar="CIDR",
                    help="One or more subnets in CIDR notation.")
     p.add_argument("--domains", metavar="FILE",
@@ -425,6 +455,10 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if not args.cidr and not args.domains and not args.host:
         p.error("at least one of --host, --cidr, or --domains is required")
+    bad_ports = sorted({pt for pt in args.ports if not 0 < pt < 65536})
+    if bad_ports:
+        p.error(f"port(s) out of range 1-65535: {', '.join(map(str, bad_ports))}")
+    args.ports = sorted(set(args.ports))
     return args
 
 
@@ -471,16 +505,27 @@ def _resolve_a(domain: str, resolver: dns.resolver.Resolver) -> list[str]:
         return []
 
 
-def resolve_all_domains(domains: list[str]) -> dict[str, tuple[list[str], list[str]]]:
-    """domain -> (cname_chain, [ip,...])."""
-    resolver = dns.resolver.Resolver()
+def resolve_all_domains(domains: list[str],
+                        workers: int = 10) -> dict[str, tuple[list[str], list[str]]]:
+    """domain -> (cname_chain, [ip,...]).
+
+    Resolution runs in a small thread pool: DNS round-trips dominate startup
+    time for large target lists, and each lookup is independent."""
     out: dict[str, tuple[list[str], list[str]]] = {}
-    for d in domains:
+    if not domains:
+        return out
+
+    def _resolve(d: str) -> tuple[list[str], list[str]]:
+        resolver = dns.resolver.Resolver()
         chain = _resolve_cname_chain(d, resolver)
         ips = _resolve_a(d, resolver)
         if not ips:
             log.warning("No A records for %s — skipping", d)
-        out[d] = (chain, ips)
+        return chain, ips
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(domains))) as ex:
+        for d, meta in zip(domains, ex.map(_resolve, domains)):
+            out[d] = meta
     return out
 
 
@@ -522,7 +567,9 @@ def build_sslscan_cmd(
         cmd.append("--iana-names")
     if show_times:
         cmd.append("--show-times")
-    cmd.append(f"{target_ip}:{port}")
+    # IPv6 literals need brackets so the port separator is unambiguous.
+    host_part = f"[{target_ip}]" if ":" in target_ip else target_ip
+    cmd.append(f"{host_part}:{port}")
     return cmd
 
 
@@ -1007,6 +1054,8 @@ Findings are graded against current best-practice baselines:
 | NULL / anonymous (ADH/AECDH) ciphers | No encryption / no authentication. |
 | Non-PFS RSA key-exchange (TLS ≤ 1.2) | Past traffic decryptable on server key compromise. |
 | CBC ciphers with TLS 1.0/1.1 | BEAST and Lucky 13 padding-oracle attacks. |
+| Expired certificate | Clients reject or click through; indicates an unmanaged endpoint. |
+| SHA-1 / MD5 certificate signature | Collision attacks make forged certificates practical; rejected by modern clients. |
 | Heartbleed (CVE-2014-0160) | Memory disclosure in vulnerable OpenSSL builds. |
 | Insecure renegotiation | CVE-2009-3555 MITM data injection. |
 | TLS compression | CRIME attack recovers session secrets. |
@@ -1046,14 +1095,15 @@ session keys and plaintext.
 
 NIST standardised the first post-quantum key-encapsulation mechanism,
 **ML-KEM** (FIPS 203, August 2024, derived from the CRYSTALS-Kyber finalist).
-The IETF and IANA assigned codepoints for hybrid TLS 1.3 named groups that
-combine ML-KEM with a classical curve so a handshake remains secure even if
-*either* primitive turns out to be weak:
+IANA registered codepoints for hybrid TLS 1.3 named groups
+(draft-ietf-tls-ecdhe-mlkem) that combine ML-KEM with a classical curve so a
+handshake remains secure even if *either* primitive turns out to be weak:
 
 | Group | IANA ID | Status |
 |---|---|---|
-| `X25519MLKEM768`           | `0x11EC` | Standardised hybrid (RFC 9606, target for default deployment) |
-| `SecP256r1MLKEM768`        | `0x11EB` | Standardised hybrid, NIST-curve variant |
+| `X25519MLKEM768`           | `0x11EC` | IANA-registered hybrid (draft-ietf-tls-ecdhe-mlkem); the default in current browsers and CDNs |
+| `SecP256r1MLKEM768`        | `0x11EB` | IANA-registered hybrid, NIST-curve variant |
+| `SecP384r1MLKEM1024`       | `0x11ED` | IANA-registered hybrid, higher-security NIST-curve variant |
 | `MLKEM512` / `MLKEM768` / `MLKEM1024` | `0x0200`–`0x0202` | Pure ML-KEM (no classical fallback) |
 | `X25519Kyber768Draft00`    | `0x6399` | Pre-standard Kyber hybrid; deployed by Chrome, Cloudflare, AWS, Google 2022–2024 |
 | `SecP256r1Kyber768Draft00` | `0x639A` | Pre-standard Kyber hybrid, NIST-curve variant |
@@ -1067,9 +1117,10 @@ Why this matters for an audit:
   `X25519MLKEM768` is at least as secure as the classical curve alone, so
   enabling it costs nothing on the security side.
 * **Pure-PQ groups** (e.g. `MLKEM768` without a classical companion) commit
-  the handshake to the newer primitive's security and are not recommended
-  for production until the algorithm has had several more years of
-  cryptanalysis.
+  the handshake to the newer primitive alone.  Most industry guidance
+  (and this report) prefers hybrids during the transition, although
+  NSA's CNSA 2.0 suite mandates pure ML-KEM-1024 for US National Security
+  Systems — treat a `pure-pq` verdict as context-dependent, not as a defect.
 * **Pre-standard Kyber draft codepoints** (`*Kyber768Draft00`) are being
   phased out in favour of the IANA-registered `*MLKEM768` groups; servers
   should migrate but supporting both during the transition is reasonable.
@@ -1170,6 +1221,7 @@ def _md_section_findings(reachable: list[HostResult]) -> str:
     """High-level rollups: weak protocol distribution, top weak ciphers."""
     proto_count: dict[str, int] = defaultdict(int)
     weak_cipher_count: dict[tuple[str, str], int] = defaultdict(int)  # (cipher, weakness) → n
+    cert_issue_count: dict[str, int] = defaultdict(int)
     vuln_count = {
         "Heartbleed":             0,
         "Insecure renegotiation": 0,
@@ -1183,6 +1235,8 @@ def _md_section_findings(reachable: list[HostResult]) -> str:
             for c, weaknesses in pr.weak_ciphers():
                 for w in weaknesses:
                     weak_cipher_count[(c.name, w)] += 1
+            for w in pr.cert.weaknesses():
+                cert_issue_count[w] += 1
             if pr.heartbleed_vulnerable:
                 vuln_count["Heartbleed"] += 1
             if pr.renegotiation_supported == "1" and pr.renegotiation_secure == "0":
@@ -1219,6 +1273,16 @@ def _md_section_findings(reachable: list[HostResult]) -> str:
     lines.append("|---|---|")
     for k, v in vuln_count.items():
         lines.append(f"| {k} | {v} |")
+    lines.append("")
+
+    lines.append("### Certificate Issues\n")
+    if cert_issue_count:
+        lines.append("| Issue | Endpoint:Port Count |")
+        lines.append("|---|---|")
+        for w, n in sorted(cert_issue_count.items(), key=lambda x: -x[1]):
+            lines.append(f"| {w} | {n} |")
+    else:
+        lines.append("_No expired or weakly-signed certificates observed._")
     lines.append("")
 
     # sslscan strength score distribution
@@ -1420,7 +1484,9 @@ def _md_section_details(reachable: list[HostResult]) -> str:
                 if c.altnames:
                     lines.append(f"| Subject Alt Names | `{c.altnames}` |")
                 lines.append(f"| Issuer | `{c.issuer}` |")
-                lines.append(f"| Signature algorithm | `{c.signature_algorithm}` |")
+                sig_issues = [w for w in c.weaknesses() if w.endswith("-SIGNATURE")]
+                sig_mark = f" ⚠️ **{', '.join(sig_issues)}**" if sig_issues else ""
+                lines.append(f"| Signature algorithm | `{c.signature_algorithm}`{sig_mark} |")
                 pk_bits = f"{c.pk_bits}-bit" if c.pk_bits else ""
                 pk_curve = f" ({c.pk_curve})" if c.pk_curve else ""
                 lines.append(f"| Public key | {c.pk_type} {pk_bits}{pk_curve} |")
@@ -1443,7 +1509,7 @@ CSV_FIELDS = [
     "tls_version", "cipher_suite", "bits", "kex_curve", "ecdhe_bits", "dhe_bits",
     "strength", "issues",
     "cert_subject", "cert_issuer", "cert_sig_algo", "cert_pq_signed",
-    "cert_not_after", "cert_expired",
+    "cert_issues", "cert_not_after", "cert_expired",
     "heartbleed", "reneg_supported", "reneg_secure",
     "compression", "fallback_scsv",
     "pq_kex_kind", "pq_groups",
@@ -1498,6 +1564,7 @@ def render_csv(hosts: list[HostResult],
                 "cert_issuer": _csv_safe(pr.cert.issuer),
                 "cert_sig_algo": _csv_safe(pr.cert.signature_algorithm),
                 "cert_pq_signed": pr.cert.is_pq_signed(),
+                "cert_issues": "|".join(pr.cert.weaknesses()),
                 "cert_not_after": pr.cert.not_after, "cert_expired": pr.cert.expired,
                 "heartbleed": ",".join(pr.heartbleed_vulnerable),
                 "reneg_supported": pr.renegotiation_supported,
@@ -1604,7 +1671,9 @@ def render_json(
                     "worst_group":  pr.worst_group_strength(),
                     "cipher_distribution": pr.cipher_strength_distribution(),
                 },
-                "certificate": {**asdict(pr.cert), "pq_signed": pr.cert.is_pq_signed()},
+                "certificate": {**asdict(pr.cert),
+                                "pq_signed": pr.cert.is_pq_signed(),
+                                "issues": pr.cert.weaknesses()},
                 "heartbleed_vulnerable": pr.heartbleed_vulnerable,
                 "renegotiation_supported": pr.renegotiation_supported,
                 "renegotiation_secure":    pr.renegotiation_secure,
@@ -2086,6 +2155,7 @@ def _html_section_summary(args, scan_date, dom_count, cidr_count,
 def _html_section_findings(reachable: list[HostResult]) -> str:
     proto_count: dict[str, int] = defaultdict(int)
     weak_cipher_count: dict[tuple[str, str], int] = defaultdict(int)
+    cert_issue_count: dict[str, int] = defaultdict(int)
     vuln_count = {"Heartbleed": 0, "Insecure renegotiation": 0,
                   "TLS compression": 0, "No TLS_FALLBACK_SCSV": 0}
     score_per_port: dict[str, int] = defaultdict(int)
@@ -2100,6 +2170,8 @@ def _html_section_findings(reachable: list[HostResult]) -> str:
             for c, weaknesses in pr.weak_ciphers():
                 for w in weaknesses:
                     weak_cipher_count[(c.name, w)] += 1
+            for w in pr.cert.weaknesses():
+                cert_issue_count[w] += 1
             if pr.heartbleed_vulnerable:
                 vuln_count["Heartbleed"] += 1
             if pr.renegotiation_supported == "1" and pr.renegotiation_secure == "0":
@@ -2136,6 +2208,10 @@ def _html_section_findings(reachable: list[HostResult]) -> str:
         for (name, w), n in sorted(weak_cipher_count.items(), key=lambda x: -x[1])
     ]
     vuln_rows = [(k, str(v)) for k, v in vuln_count.items()]
+    cert_issue_rows = [
+        (_html_escape(w), str(n))
+        for w, n in sorted(cert_issue_count.items(), key=lambda x: -x[1])
+    ]
     score_rows = []
     ordered = list(STRENGTH_BUCKETS) + sorted(
         {k for k in (score_per_port | score_per_cipher | score_per_group)
@@ -2172,6 +2248,9 @@ def _html_section_findings(reachable: list[HostResult]) -> str:
             "No weak cipher suites observed.")}
     <h4>Protocol-level vulnerabilities</h4>
     {_table(["Issue", "Endpoint:Port count"], vuln_rows, "")}
+    <h4>Certificate issues</h4>
+    {_table(["Issue", "Endpoint:Port count"], cert_issue_rows,
+            "No expired or weakly-signed certificates observed.")}
     <h4>sslscan strength score distribution</h4>
     {_table(["Score", "Overall (per port)", "Ciphers", "KX Groups"], score_rows,
             "No strength data collected.")}
@@ -2370,7 +2449,9 @@ def _html_port_block(pr: PortResult) -> str:
              f"<code>{_html_escape(c.altnames)}</code>" if c.altnames else "—"),
             ("Issuer", f"<code>{_html_escape(c.issuer)}</code>"),
             ("Signature algorithm", f"<code>{_html_escape(c.signature_algorithm)}</code>"
-             + (' <span class="badge good">PQ</span>' if c.is_pq_signed() else '')),
+             + (' <span class="badge good">PQ</span>' if c.is_pq_signed() else '')
+             + "".join(f' <span class="badge bad">{_html_escape(w)}</span>'
+                       for w in c.weaknesses() if w.endswith("-SIGNATURE"))),
             ("Public key", _html_escape(
                 f"{c.pk_type} {c.pk_bits}-bit"
                 + (f" ({c.pk_curve})" if c.pk_curve else "")
@@ -2450,18 +2531,23 @@ def main() -> int:
     # below after orchestration so duration_s is real.
     run_meta = collect_run_metadata(args, sslscan, started.isoformat())
 
-    # Split --host values: bare IPs become /32 CIDRs; everything else is a domain.
+    # Split --host values: bare IPs become single-address CIDRs (/32 for IPv4,
+    # /128 for IPv6 — a literal /32 on an IPv6 address would expand to 2^96
+    # hosts); everything else is a domain.
     cli_domains: list[str] = []
     cli_cidrs: list[str] = []
     for h in (args.host or []):
         try:
-            ipaddress.ip_address(h)
-            cli_cidrs.append(f"{h}/32")
+            ip = ipaddress.ip_address(h)
+            cli_cidrs.append(f"{h}/{ip.max_prefixlen}")
         except ValueError:
             cli_domains.append(h)
 
-    domains = cli_domains + (load_domains(args.domains) if args.domains else [])
-    cidrs = cli_cidrs + (args.cidr or [])
+    # Dedupe while preserving order so a host listed twice (CLI + file)
+    # isn't scanned twice.
+    domains = list(dict.fromkeys(
+        cli_domains + (load_domains(args.domains) if args.domains else [])))
+    cidrs = list(dict.fromkeys(cli_cidrs + (args.cidr or [])))
 
     log.info("Resolving DNS for %d domain(s) …", len(domains))
     domain_meta = resolve_all_domains(domains)
@@ -2471,6 +2557,11 @@ def main() -> int:
         args.connect_timeout, args.socket_timeout,
         args.iana_names, args.show_times,
     )
+    if not jobs:
+        # Exiting 0 here would let a CI gate pass without scanning anything.
+        log.error("No scannable targets (DNS resolution failed or CIDRs were "
+                  "invalid/empty) — nothing was audited.")
+        return 2
     results_map = run_all_jobs(jobs, args.workers, domain_meta)
     hosts = list(results_map.values())
     n_reachable = sum(1 for h in hosts if h.reachable_ports())
@@ -2517,4 +2608,5 @@ if __name__ == "__main__":
         sys.exit(130)
     except Exception as exc:
         log.error("Fatal: %s", exc)
+        log.debug("Traceback:", exc_info=True)
         sys.exit(2)

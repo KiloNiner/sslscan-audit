@@ -33,7 +33,7 @@ All data is held in dataclasses (no ORM, no database):
 
 - `Cipher` — one accepted cipher suite; `weaknesses()` returns tags like `SHA1-MAC`, `NO-PFS`, `RC4`
 - `KexGroup` — one offered TLS key-exchange group; `is_pq()` / `is_hybrid_pq()` detect post-quantum groups
-- `Certificate` — parsed from sslscan's `<certificates>` XML element; `is_pq_signed()` detects ML-DSA/SLH-DSA/Falcon signatures
+- `Certificate` — parsed from sslscan's `<certificates>` XML element; `is_pq_signed()` detects ML-DSA/SLH-DSA/Falcon signatures; `weaknesses()` returns tags like `EXPIRED`, `SHA1-SIGNATURE`, `MD5-SIGNATURE`
 - `PortResult` — aggregates ciphers, groups, cert, and vulnerability flags for one `(host, port)` scan; `has_findings()` is the single truth for whether this port counts as a finding
 - `HostResult` — aggregates `PortResult`s for one `(target, ip)` pair; `has_findings()` delegates to its ports
 - `Job` — holds the sslscan command list and metadata for one scan unit, created by `plan_jobs()`
@@ -44,12 +44,12 @@ All data is held in dataclasses (no ORM, no database):
 ```
 parse_args()
   → load_domains() + split --host into domain/CIDR lists
-  → resolve_all_domains()          # DNS CNAME chains + A records
+  → resolve_all_domains()          # DNS CNAME chains + A records (thread pool)
   → plan_jobs()                    # build one Job per (ip, port) pair
   → run_all_jobs()                 # ThreadPoolExecutor, runs sslscan --xml=-
       → parse_sslscan_xml()        # ElementTree, returns PortResult
   → render_one() × N formats       # md / csv / json / html
-  → exit 0 (clean) / 1 (findings) / 2 (error) / 130 (SIGINT)
+  → exit 0 (clean) / 1 (findings) / 2 (error or zero scannable targets) / 130 (SIGINT)
 ```
 
 ### Key design decisions

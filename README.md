@@ -15,7 +15,8 @@ scraping of human-readable output), and produces a posture report covering:
 * TLS 1.3 / 1.2 supported key-exchange groups, including post-quantum hybrids
   (`X25519MLKEM768`, `SecP256r1MLKEM768`, `X25519Kyber768Draft00`, …)
 * Certificate details (subject, SANs, issuer, signature algorithm, validity,
-  PQ signature detection)
+  PQ signature detection) with certificate-level findings (expired,
+  SHA-1/MD5 signature)
 * Vulnerability flags: Heartbleed, insecure renegotiation, CRIME (TLS
   compression), `TLS_FALLBACK_SCSV`
 * Per-endpoint sslscan strength score and post-quantum handshake readiness
@@ -46,15 +47,13 @@ python sslscan_audit.py --domains targets.txt
 
 ## Arguments
 
-At least one of `--cidr` or `--domains` is required.
-
 ### Targets
 
 At least one of `--host`, `--cidr`, or `--domains` is required; they may be combined freely.
 
 | Flag | Description |
 | --- | --- |
-| `--host HOST [HOST ...]` | One or more hostnames or IP addresses to scan directly. Hostnames are resolved via DNS (CNAME chains followed, SNI set); bare IP addresses are scanned without SNI, equivalent to a `/32` CIDR entry. |
+| `--host HOST [HOST ...]` | One or more hostnames or IP addresses to scan directly. Hostnames are resolved via DNS (CNAME chains followed, SNI set); bare IP addresses are scanned without SNI, equivalent to a single-address CIDR entry (`/32` for IPv4, `/128` for IPv6). |
 | `--cidr CIDR [CIDR ...]` | One or more subnets in CIDR notation (e.g. `10.0.0.0/24 192.168.1.0/28`). Every host in each subnet is scanned without SNI. |
 | `--domains FILE` | Path to a file with one domain per line. Blank lines and lines starting with `#` are ignored. Each domain is resolved via DNS (CNAME chains are followed). |
 | `--ports PORT [PORT ...]` | Ports to probe. Default: `21 25 110 143 389 443 465 587 993 995 8443`. Ports with a well-known STARTTLS mapping (see below) automatically receive `--starttls-<proto>`; all others are treated as implicit TLS. |
@@ -110,8 +109,8 @@ fail (exit code `1`) until they are fixed:
 | Code | Meaning |
 | --- | --- |
 | `0` | Scan completed, no findings. |
-| `1` | Scan completed, one or more endpoints were flagged (weak ciphers/protocols, vulnerabilities, or any CI gate hit). |
-| `2` | Execution error (sslscan missing, fatal exception, etc.). `130` if interrupted with Ctrl-C. |
+| `1` | Scan completed, one or more endpoints were flagged (weak ciphers/protocols, expired or weakly-signed certificates, vulnerabilities, or any CI gate hit). |
+| `2` | Execution error (sslscan missing, no scannable targets after DNS resolution, fatal exception, etc.). `130` if interrupted with Ctrl-C. |
 
 ## Examples
 
