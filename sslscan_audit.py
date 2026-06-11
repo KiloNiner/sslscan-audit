@@ -44,7 +44,7 @@ import re
 import shutil
 import subprocess
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -2160,6 +2160,40 @@ details.port { background: var(--bg-3); }
 .context p, .findings p { margin: .5rem 0; }
 .context li { margin: .25rem 0; }
 
+/* ---- at-a-glance charts (pure CSS, no JS) ---- */
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1rem; margin: 1rem 0 1.5rem; }
+.chart { background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: .75rem .9rem; }
+.chart h4 { margin: .1rem 0 .6rem; color: var(--fg); }
+.chart-sub { color: var(--fg-dim); font-weight: 400; font-size: .8rem; }
+.stacked-bar { display: flex; height: 1.4rem; border-radius: 6px;
+  overflow: hidden; border: 1px solid var(--border); background: var(--bg-3); }
+.stacked-bar .seg { height: 100%; min-width: 2px; }
+.legend { display: flex; flex-wrap: wrap; gap: .35rem .9rem;
+  margin-top: .5rem; font-size: .82rem; color: var(--fg-dim); }
+.hbar-row { display: flex; align-items: center; gap: .5rem;
+  margin: .3rem 0; font-size: .82rem; }
+.hbar-label { flex: 0 0 9.5rem; text-align: right; font-family: var(--mono);
+  color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.hbar { flex: 1; background: var(--bg-3); border-radius: 4px;
+  height: .8rem; overflow: hidden; }
+.hbar-fill { height: 100%; border-radius: 4px; }
+.hbar-count { flex: 0 0 2.4rem; color: var(--fg-dim); }
+/* chart series colours (shared by bar segments and legend dots) */
+.cs-strong     { background: #3fb950; }
+.cs-good       { background: #56d364; }
+.cs-acceptable { background: #d29922; }
+.cs-medium     { background: #e3b341; }
+.cs-weak       { background: #f85149; }
+.cs-anonymous  { background: #da3633; }
+.cs-null       { background: #8b1a1a; }
+.cs-unknown    { background: #8b949e; }
+.cs-hybrid     { background: #3fb950; }
+.cs-purepq     { background: #d29922; }
+.cs-nopq       { background: #f85149; }
+
 .no-results { color: var(--fg-dim); font-style: italic; padding: .75rem 0; }
 .footer { color: var(--fg-dim); font-size: .82rem;
   border-top: 1px solid var(--border); margin-top: 2rem; padding-top: .75rem; }
@@ -2234,6 +2268,92 @@ def _pq_kind_badge(kind: str) -> str:
     return '<span class="badge bad">no PQ</span>'
 
 
+def _chart_stacked_bar(segments: list[tuple[str, int, str]]) -> str:
+    """One horizontal stacked bar + legend from [(label, count, css_class)].
+    Pure HTML/CSS so the report stays self-contained and printable."""
+    total = sum(n for _, n, _ in segments)
+    if total == 0:
+        return '<p class="no-results">No data.</p>'
+    seg_html = "".join(
+        f'<div class="seg {cls}" style="width:{100 * n / total:.2f}%" '
+        f'title="{_html_escape(label)}: {n}"></div>'
+        for label, n, cls in segments if n
+    )
+    legend = " ".join(
+        f'<span class="legend-item"><span class="dot {cls}"></span>'
+        f'{_html_escape(label)}: {n}</span>'
+        for label, n, cls in segments if n
+    )
+    return (f'<div class="stacked-bar">{seg_html}</div>'
+            f'<div class="legend">{legend}</div>')
+
+
+def _html_section_charts(reachable: list[HostResult]) -> str:
+    """'At a glance' strip at the top of the HTML report: PQ readiness,
+    strength distribution, and the most frequent finding tags."""
+    ports = [pr for h in reachable for pr in h.reachable_ports()]
+    if not ports:
+        return ""
+
+    pq = Counter(pr.pq_kex_kind() for pr in ports)
+    pq_bar = _chart_stacked_bar([
+        ("hybrid PQ", pq.get("hybrid", 0), "cs-hybrid"),
+        ("pure PQ", pq.get("pure-pq", 0), "cs-purepq"),
+        ("no PQ", pq.get("none", 0), "cs-nopq"),
+    ])
+
+    strength = Counter((pr.overall_strength() or "unknown").lower()
+                       for pr in ports)
+    strength_segments = [(b, strength.get(b, 0), f"cs-{b}")
+                         for b in reversed(STRENGTH_BUCKETS)]   # best → worst
+    other = sum(n for lbl, n in strength.items()
+                if lbl not in STRENGTH_ORDER)
+    if other:
+        strength_segments.append(("unknown", other, "cs-unknown"))
+    strength_bar = _chart_stacked_bar(strength_segments)
+
+    tag_counts = Counter(t for pr in ports for t in pr.finding_tags())
+    if tag_counts:
+        max_n = max(tag_counts.values())
+        rows = []
+        for tag, n in tag_counts.most_common(8):
+            level = SARIF_RULE_META.get(tag, ("warning", "", ""))[0]
+            cls = "cs-weak" if level == "error" else "cs-acceptable"
+            rows.append(
+                f'<div class="hbar-row">'
+                f'<span class="hbar-label" title="{_html_escape(tag)}">'
+                f'{_html_escape(tag)}</span>'
+                f'<div class="hbar"><div class="hbar-fill {cls}" '
+                f'style="width:{100 * n / max_n:.1f}%"></div></div>'
+                f'<span class="hbar-count">{n}</span></div>'
+            )
+        if len(tag_counts) > 8:
+            rows.append(f'<p class="no-results">… and '
+                        f'{len(tag_counts) - 8} more tag(s), see below.</p>')
+        findings_chart = "".join(rows)
+    else:
+        findings_chart = '<p class="no-results">No findings across any port.</p>'
+
+    return f"""
+<div class="charts">
+  <div class="chart">
+    <h4>Post-quantum key-exchange readiness
+        <span class="chart-sub">({len(ports)} port(s))</span></h4>
+    {pq_bar}
+  </div>
+  <div class="chart">
+    <h4>sslscan strength <span class="chart-sub">(worst-of per port)</span></h4>
+    {strength_bar}
+  </div>
+  <div class="chart">
+    <h4>Top finding tags
+        <span class="chart-sub">(occurrences across ports)</span></h4>
+    {findings_chart}
+  </div>
+</div>
+"""
+
+
 def render_html(
     hosts: list[HostResult],
     args: argparse.Namespace,
@@ -2284,6 +2404,7 @@ def render_html(
 </div>
 """)
 
+    parts.append(_html_section_charts(reachable))
     if run_meta is not None:
         parts.append(_html_section_run_metadata(run_meta))
     parts.append(_html_section_context())

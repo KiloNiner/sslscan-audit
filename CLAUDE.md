@@ -76,6 +76,8 @@ parse_args()
 
 **HTML filter/expand:** The HTML report embeds inline CSS and a small JS snippet (`HTML_JS`) that wires up the filter input and expand/collapse buttons client-side. Run metadata is also embedded as an HTML comment (`<!-- … -->`) for grep-ability even with JS disabled.
 
+**HTML at-a-glance charts:** `_html_section_charts()` renders a chart strip at the top of the HTML report (PQ readiness stacked bar, strength-distribution stacked bar, top-finding-tags bar list) in pure HTML/CSS — no JS, no external chart library — so the report stays self-contained, printable, and renders with JS disabled. Series colours are `cs-*` classes shared between bar segments and legend dots.
+
 ### Output formats
 
 All five formats (`md`, `csv`, `json`, `html`, `sarif`) are dispatched through `render_one()`. With a single `--format` the result goes to `--output` or stdout. With multiple formats, `--output` is used as a filename stem and the extension is appended (e.g. `report.md`, `report.json`). SARIF always reports every finding tag regardless of `--fail-on`.

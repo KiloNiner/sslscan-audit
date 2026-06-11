@@ -33,6 +33,7 @@ from sslscan_audit import (
     load_baseline,
     parse_sslscan_xml,
     plan_jobs,
+    render_html,
     render_md,
     render_sarif,
 )
@@ -704,6 +705,60 @@ class TestMarkdownPortHeading:
         md = self._render(443)
         assert "#### Port 443\n" in md
         assert "STARTTLS" not in md
+
+
+# ---------------------------------------------------------------------------
+# 9b. HTML report — at-a-glance charts
+# ---------------------------------------------------------------------------
+
+class TestHtmlCharts:
+    def _render(self, hosts):
+        args = SimpleNamespace(
+            cidr=None, ports=[443], workers=1,
+            strict_pq=False, min_score=None,
+        )
+        return render_html(
+            hosts=hosts,
+            args=args,
+            scan_date="2026-01-01 00:00 UTC",
+            domain_meta={h.target: ([], [h.ip]) for h in hosts},
+            domain_count=len(hosts),
+        )
+
+    def _host(self, xml=SAMPLE_XML, target="example.com"):
+        pr = parse_sslscan_xml(xml, f"{target}:443")
+        host = HostResult(target=target, ip="1.2.3.4", source="domain")
+        host.ports[443] = pr
+        return host
+
+    def test_chart_strip_present(self):
+        html = self._render([self._host()])
+        assert 'class="charts"' in html
+        assert "Post-quantum key-exchange readiness" in html
+        assert "sslscan strength" in html
+        assert "Top finding tags" in html
+
+    def test_pq_segments_reflect_data(self):
+        # SAMPLE_XML offers X25519MLKEM768 → hybrid segment, no no-PQ segment.
+        # (Match on segment titles — the cs-* class names always appear in
+        # the embedded stylesheet regardless of data.)
+        html = self._render([self._host()])
+        assert 'title="hybrid PQ: 1"' in html
+        assert 'title="no PQ' not in html
+
+    def test_finding_tags_charted(self):
+        html = self._render([self._host()])
+        assert ">RC4</span>" in html       # hbar label for the RC4 tag
+
+    def test_clean_host_shows_no_findings_message(self):
+        html = self._render([self._host(xml=PQ_CERT_XML, target="pq.example.com")])
+        assert "No findings across any port." in html
+
+    def test_no_reachable_ports_no_chart_strip(self):
+        host = HostResult(target="down.example.com", ip="1.2.3.4", source="domain")
+        host.ports[443] = PortResult(port=443, reachable=False)
+        html = self._render([host])
+        assert 'class="charts"' not in html
 
 
 # ---------------------------------------------------------------------------
