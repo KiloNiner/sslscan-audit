@@ -16,8 +16,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import sslscan_audit as sa
 from sslscan_audit import (
     DEFAULT_PORTS,
+    KNOWN_FINDING_TAGS,
     STARTTLS_PORTS,
     Certificate,
     Cipher,
@@ -27,9 +29,12 @@ from sslscan_audit import (
     _worst_strength,
     _strength_rank,
     build_sslscan_cmd,
+    diff_against_baseline,
+    load_baseline,
     parse_sslscan_xml,
     plan_jobs,
     render_md,
+    render_sarif,
 )
 
 # ---------------------------------------------------------------------------
@@ -468,6 +473,72 @@ class TestCertificateWeaknesses:
 
 
 # ---------------------------------------------------------------------------
+# 5c. Finding tags & CI gates (--fail-on / --strict-pq-hybrid)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _restore_gates():
+    """Snapshot and restore the module-level gate globals around a test."""
+    saved = (sa.STRICT_PQ, sa.STRICT_PQ_HYBRID, sa.MIN_SCORE_RANK, sa.FAIL_ON)
+    yield
+    sa.STRICT_PQ, sa.STRICT_PQ_HYBRID, sa.MIN_SCORE_RANK, sa.FAIL_ON = saved
+
+
+class TestFindingTags:
+    def test_sample_xml_tags(self, parsed):
+        tags = parsed.finding_tags()
+        assert {"RC4", "DES/3DES", "SHA1-MAC", "NO-PFS"} <= tags
+        # No gates active → no gate tags.
+        assert not tags & {"NO-PQ", "NO-PQ-HYBRID", "BELOW-MIN-SCORE"}
+
+    def test_vulnerable_host_tags(self):
+        pr = parse_sslscan_xml(HEARTBLEED_XML, "vuln:443")
+        assert {"HEARTBLEED", "TLS-COMPRESSION", "INSECURE-RENEG"} <= pr.finding_tags()
+
+    def test_all_tags_are_known(self, parsed):
+        pr = parse_sslscan_xml(HEARTBLEED_XML, "vuln:443")
+        expired = parse_sslscan_xml(EXPIRED_CERT_XML, "old:443")
+        for tags in (parsed.finding_tags(), pr.finding_tags(),
+                     expired.finding_tags()):
+            assert tags <= KNOWN_FINDING_TAGS
+
+    def test_fail_on_restricts_exit_gate(self, parsed, _restore_gates):
+        # SAMPLE_XML has RC4 etc. but no Heartbleed: with the gate narrowed
+        # to HEARTBLEED the endpoint must not be flagged.
+        sa.FAIL_ON = frozenset({"HEARTBLEED"})
+        assert not parsed.has_findings()
+        sa.FAIL_ON = frozenset({"RC4"})
+        assert parsed.has_findings()
+
+    def test_fail_on_no_pq_activates_gate(self, _restore_gates):
+        pr = PortResult(port=443, reachable=True)
+        assert not pr.has_findings()
+        sa.FAIL_ON = frozenset({"NO-PQ"})
+        assert "NO-PQ" in pr.finding_tags()
+        assert pr.has_findings()
+
+    def test_strict_pq_hybrid_flags_pure_pq(self, _restore_gates):
+        pr = PortResult(port=443, reachable=True)
+        pr.groups.append(KexGroup(protocol="TLSv1.3", name="MLKEM768",
+                                  bits=256, strength="good"))
+        assert not pr.has_findings()          # pure-PQ passes by default
+        sa.STRICT_PQ_HYBRID = True
+        assert "NO-PQ-HYBRID" in pr.finding_tags()
+        assert pr.has_findings()
+        # …and a hybrid group satisfies the gate.
+        pr.groups.append(KexGroup(protocol="TLSv1.3", name="X25519MLKEM768",
+                                  bits=256, strength="good"))
+        assert not pr.has_findings()
+
+    def test_strict_pq_satisfied_by_pure_pq(self, _restore_gates):
+        pr = PortResult(port=443, reachable=True)
+        pr.groups.append(KexGroup(protocol="TLSv1.3", name="MLKEM768",
+                                  bits=256, strength="good"))
+        sa.STRICT_PQ = True
+        assert not pr.has_findings()
+
+
+# ---------------------------------------------------------------------------
 # 6. Post-quantum detection
 # ---------------------------------------------------------------------------
 
@@ -636,7 +707,114 @@ class TestMarkdownPortHeading:
 
 
 # ---------------------------------------------------------------------------
-# 10. Integration tests (require sslscan + network; skipped by default)
+# 10. SARIF output
+# ---------------------------------------------------------------------------
+
+class TestSarif:
+    def _hosts(self):
+        pr = parse_sslscan_xml(SAMPLE_XML, "example.com:443")
+        host = HostResult(target="example.com", ip="1.2.3.4", source="domain")
+        host.ports[443] = pr
+        return [host]
+
+    def test_valid_sarif_structure(self):
+        import json
+        doc = json.loads(render_sarif(self._hosts()))
+        assert doc["version"] == "2.1.0"
+        assert "sarif-schema-2.1.0" in doc["$schema"]
+        run = doc["runs"][0]
+        assert run["tool"]["driver"]["name"] == "sslscan_audit"
+        assert run["results"]
+
+    def test_results_carry_rules_and_locations(self):
+        import json
+        doc = json.loads(render_sarif(self._hosts()))
+        run = doc["runs"][0]
+        rule_ids = {r["ruleId"] for r in run["results"]}
+        assert {"RC4", "SHA1-MAC", "DES/3DES"} <= rule_ids
+        declared = {r["id"] for r in run["tool"]["driver"]["rules"]}
+        assert rule_ids <= declared
+        loc = run["results"][0]["locations"][0]
+        assert loc["physicalLocation"]["artifactLocation"]["uri"] == \
+            "tls://example.com:443"
+
+    def test_clean_host_produces_no_results(self):
+        import json
+        pr = parse_sslscan_xml(PQ_CERT_XML, "pq:443")
+        host = HostResult(target="pq.example.com", ip="1.2.3.4", source="domain")
+        host.ports[443] = pr
+        doc = json.loads(render_sarif([host]))
+        assert doc["runs"][0]["results"] == []
+
+
+# ---------------------------------------------------------------------------
+# 11. Baseline / regression diffing
+# ---------------------------------------------------------------------------
+
+class TestBaseline:
+    def _host(self, xml=SAMPLE_XML, target="example.com", ip="1.2.3.4"):
+        pr = parse_sslscan_xml(xml, f"{target}:443")
+        host = HostResult(target=target, ip=ip, source="domain")
+        host.ports[443] = pr
+        return host
+
+    def test_no_regressions_when_baseline_matches(self):
+        host = self._host()
+        baseline = {("example.com", "1.2.3.4", 443):
+                    set(host.ports[443].finding_tags())}
+        assert diff_against_baseline(baseline, [host]) == []
+
+    def test_new_tag_is_a_regression(self):
+        host = self._host()
+        tags = set(host.ports[443].finding_tags())
+        tags.discard("RC4")
+        baseline = {("example.com", "1.2.3.4", 443): tags}
+        regs = diff_against_baseline(baseline, [host])
+        assert regs == [("example.com", "1.2.3.4", 443, ["RC4"])]
+
+    def test_unknown_endpoint_counts_in_full(self):
+        host = self._host(target="new.example.com")
+        regs = diff_against_baseline({}, [host])
+        assert len(regs) == 1
+        assert "RC4" in regs[0][3]
+
+    def test_fixed_finding_is_not_a_regression(self):
+        # Baseline has MORE findings than current → clean diff.
+        host = self._host(xml=PQ_CERT_XML, target="pq.example.com")
+        baseline = {("pq.example.com", "1.2.3.4", 443): {"RC4", "SHA1-MAC"}}
+        assert diff_against_baseline(baseline, [host]) == []
+
+    def test_load_baseline_roundtrip(self, tmp_path):
+        import json
+        doc = {"endpoints": [{
+            "target": "example.com", "ip": "1.2.3.4",
+            "ports": [{"port": 443, "finding_tags": ["RC4", "SHA1-MAC"]}],
+        }]}
+        f = tmp_path / "base.json"
+        f.write_text(json.dumps(doc))
+        loaded = load_baseline(str(f))
+        assert loaded == {("example.com", "1.2.3.4", 443): {"RC4", "SHA1-MAC"}}
+
+    def test_load_baseline_rejects_old_schema(self, tmp_path):
+        import json
+        doc = {"endpoints": [{
+            "target": "example.com", "ip": "1.2.3.4",
+            "ports": [{"port": 443}],   # no finding_tags → pre-0.5.0
+        }]}
+        f = tmp_path / "old.json"
+        f.write_text(json.dumps(doc))
+        with pytest.raises(RuntimeError, match="finding_tags"):
+            load_baseline(str(f))
+
+    def test_load_baseline_rejects_non_report(self, tmp_path):
+        f = tmp_path / "junk.json"
+        f.write_text('{"foo": 1}')
+        with pytest.raises(RuntimeError, match="endpoints"):
+            load_baseline(str(f))
+
+
+# ---------------------------------------------------------------------------
+# 12. Integration tests (require sslscan + network; skipped by default)
 # ---------------------------------------------------------------------------
 
 integration = pytest.mark.skipif(

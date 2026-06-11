@@ -20,6 +20,9 @@ scraping of human-readable output), and produces a posture report covering:
 * Vulnerability flags: Heartbleed, insecure renegotiation, CRIME (TLS
   compression), `TLS_FALLBACK_SCSV`
 * Per-endpoint sslscan strength score and post-quantum handshake readiness
+* A canonical per-port finding-tag taxonomy driving granular CI gates
+  (`--fail-on`, `--strict-pq`, `--strict-pq-hybrid`, `--min-score`),
+  SARIF 2.1.0 output, and baseline/regression diffing (`--baseline`)
 
 ## Requirements
 
@@ -57,6 +60,7 @@ At least one of `--host`, `--cidr`, or `--domains` is required; they may be comb
 | `--cidr CIDR [CIDR ...]` | One or more subnets in CIDR notation (e.g. `10.0.0.0/24 192.168.1.0/28`). Every host in each subnet is scanned without SNI. |
 | `--domains FILE` | Path to a file with one domain per line. Blank lines and lines starting with `#` are ignored. Each domain is resolved via DNS (CNAME chains are followed). |
 | `--ports PORT [PORT ...]` | Ports to probe. Default: `21 25 110 143 389 443 465 587 993 995 8443`. Ports with a well-known STARTTLS mapping (see below) automatically receive `--starttls-<proto>`; all others are treated as implicit TLS. |
+| `--ipv6` | Also resolve AAAA records and scan the resulting IPv6 addresses (requires IPv6 connectivity from the scanning host). Bare IPv6 literals given via `--host`/`--cidr` are always scanned regardless of this flag. |
 
 ### STARTTLS port mapping
 
@@ -94,13 +98,30 @@ fail (exit code `1`) until they are fixed:
 | Flag | Description |
 | --- | --- |
 | `--strict-pq` | Treat any endpoint that doesn't negotiate a post-quantum key-exchange group as a finding. Useful for enforcing PQ readiness across a fleet. |
+| `--strict-pq-hybrid` | Like `--strict-pq`, but require a *hybrid* (PQ + classical) group specifically — endpoints offering only pure-PQ groups are also flagged. |
 | `--min-score LABEL` | Treat any endpoint scored below `LABEL` as a finding. Choices, worst → best: `null`, `anonymous`, `weak`, `medium`, `acceptable`, `good`, `strong`. |
+| `--fail-on TAG [TAG ...]` | Restrict the exit-code gate to specific finding tags (comma- or space-separated, case-insensitive). Reports still show every finding; only the named tags flag endpoints and drive exit code `1`. Naming `NO-PQ` or `NO-PQ-HYBRID` activates that PQ gate implicitly, so `--fail-on NO-PQ-HYBRID` alone gives you a CI run that fails *only* on missing hybrid PQ support. |
+| `--baseline FILE` | Diff against a previous JSON report (`--format json`, script ≥ 0.5.0): exit `1` only if an endpoint:port shows a finding tag that wasn't in the baseline (a regression). Pre-existing findings are still reported but don't fail the run — ideal for ratcheting a fleet toward a target posture without a big-bang cleanup. |
+
+### Finding tags
+
+These are the values accepted by `--fail-on`, recorded per port in the JSON
+(`finding_tags`) and CSV (`finding_tags` column) outputs, and used as SARIF
+rule IDs:
+
+| Tag | Source | Meaning |
+| --- | --- | --- |
+| `WEAK-PROTOCOL` | protocols | SSLv2/SSLv3/TLS 1.0/TLS 1.1 enabled |
+| `NULL`, `ANON`, `EXPORT`, `DES/3DES`, `RC4`, `SHA1-MAC`, `CBC-OLD-TLS`, `NO-PFS` | cipher suites | Per-cipher weaknesses |
+| `EXPIRED`, `SHA1-SIGNATURE`, `MD5-SIGNATURE` | certificate | Certificate expired / weak signature digest |
+| `HEARTBLEED`, `TLS-COMPRESSION`, `INSECURE-RENEG` | handshake checks | Protocol-level vulnerabilities |
+| `NO-PQ`, `NO-PQ-HYBRID`, `BELOW-MIN-SCORE` | CI gates | Only produced when the corresponding gate is active (via its flag or by being named in `--fail-on`) |
 
 ### Output
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--format FMT [FMT ...]` | `md` | One or more output formats. Choices: `md`, `csv`, `json`, `html`. |
+| `--format FMT [FMT ...]` | `md` | One or more output formats. Choices: `md`, `csv`, `json`, `html`, `sarif`. The `sarif` format emits SARIF 2.1.0 with one rule per finding tag, suitable for GitHub code scanning and similar dashboards (SARIF always reports every finding, regardless of `--fail-on`). |
 | `--output STEM` | stdout | Destination. With a single `--format` it's the filename; with multiple, it's a stem and the format extension is appended (e.g. `--output report --format md json` → `report.md`, `report.json`). |
 | `--verbose`, `-v` | off | Enable DEBUG-level logging on stderr. |
 
@@ -108,8 +129,8 @@ fail (exit code `1`) until they are fixed:
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Scan completed, no findings. |
-| `1` | Scan completed, one or more endpoints were flagged (weak ciphers/protocols, expired or weakly-signed certificates, vulnerabilities, or any CI gate hit). |
+| `0` | Scan completed, no findings (with `--baseline`: no regressions). |
+| `1` | Scan completed, one or more endpoints were flagged (weak ciphers/protocols, expired or weakly-signed certificates, vulnerabilities, or any CI gate hit). With `--fail-on`, only the named tags flag endpoints; with `--baseline`, only regressions versus the baseline. |
 | `2` | Execution error (sslscan missing, no scannable targets after DNS resolution, fatal exception, etc.). `130` if interrupted with Ctrl-C. |
 
 ## Examples
@@ -172,6 +193,32 @@ sslscan_audit.py \
   --min-score good \
   --strict-pq \
   --format json --output ci-report.json
+```
+
+CI gate for a post-quantum rollout — fail *only* when an endpoint lacks a
+hybrid PQ key exchange, while still reporting everything else:
+
+```bash
+sslscan_audit.py \
+  --domains prod-domains.txt \
+  --fail-on NO-PQ-HYBRID \
+  --format json sarif --output pq-rollout
+```
+
+Ratchet mode — fail the build only on *regressions* against last week's
+report (pre-existing findings are reported but tolerated):
+
+```bash
+sslscan_audit.py --domains targets.txt --format json --output this-week.json \
+  --baseline last-week.json
+```
+
+Dual-stack scan including IPv6 endpoints, with SARIF for GitHub code
+scanning:
+
+```bash
+sslscan_audit.py --domains targets.txt --ipv6 \
+  --format sarif --output tls-audit.sarif
 ```
 
 Point at a non-default `sslscan` binary (e.g. one you built from source with

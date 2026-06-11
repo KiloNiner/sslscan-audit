@@ -24,9 +24,10 @@ XML parsing is exact — no scraping of human-readable sslscan output.
 
 Usage:
   sslscan_audit.py [--host HOST ...] [--cidr CIDR ...] [--domains FILE] \\
-                   [--ports PORT ...] [--workers N] \\
-                   [--strict-pq] [--min-score LABEL] \\
-                   [--format md csv json html] [--output STEM]
+                   [--ports PORT ...] [--workers N] [--ipv6] \\
+                   [--strict-pq] [--strict-pq-hybrid] [--min-score LABEL] \\
+                   [--fail-on TAG ...] [--baseline FILE] \\
+                   [--format md csv json html sarif] [--output STEM]
 """
 
 from __future__ import annotations
@@ -79,16 +80,37 @@ DEFAULT_SOCKET_TIMEOUT  = 5   # seconds, passed to sslscan --timeout
 SUBPROC_TIMEOUT_FACTOR  = 12  # subprocess wall-clock = factor * socket_timeout + 30
 
 # Tool version — bump when the report schema or scoring logic changes.
-SCRIPT_VERSION = "0.4.0"
+SCRIPT_VERSION = "0.5.0"
 
 # Mutable runtime config (set in main() so we don't have to plumb it through
 # every helper).  STRICT_PQ promotes "no PQ key-exchange" to a finding;
-# MIN_SCORE_RANK promotes "endpoint scored below this sslscan label" to a finding.
+# STRICT_PQ_HYBRID additionally requires a *hybrid* (PQ + classical) group;
+# MIN_SCORE_RANK promotes "endpoint scored below this sslscan label" to a
+# finding; FAIL_ON, when set, restricts which finding tags drive
+# has_findings() (and therefore the exit code) — reports always show
+# everything regardless.
 STRICT_PQ = False
+STRICT_PQ_HYBRID = False
 MIN_SCORE_RANK: int | None = None   # None disables the gate
+FAIL_ON: frozenset[str] | None = None  # None = every tag counts
 
 # Weak protocols (always flagged)
 WEAK_PROTOCOLS = {"SSLv2", "SSLv3", "TLSv1.0", "TLSv1.1"}
+
+# Canonical finding-tag taxonomy.  Cipher and certificate tags are produced
+# by Cipher.weaknesses() / Certificate.weaknesses(); port-level and gate tags
+# by PortResult.finding_tags().  --fail-on values are validated against this.
+CIPHER_FINDING_TAGS = frozenset({
+    "NULL", "ANON", "EXPORT", "DES/3DES", "RC4",
+    "SHA1-MAC", "CBC-OLD-TLS", "NO-PFS",
+})
+CERT_FINDING_TAGS = frozenset({"EXPIRED", "SHA1-SIGNATURE", "MD5-SIGNATURE"})
+PORT_FINDING_TAGS = frozenset({
+    "WEAK-PROTOCOL", "HEARTBLEED", "TLS-COMPRESSION", "INSECURE-RENEG",
+})
+GATE_FINDING_TAGS = frozenset({"NO-PQ", "NO-PQ-HYBRID", "BELOW-MIN-SCORE"})
+KNOWN_FINDING_TAGS = (CIPHER_FINDING_TAGS | CERT_FINDING_TAGS
+                      | PORT_FINDING_TAGS | GATE_FINDING_TAGS)
 
 # Cipher-name regex tags. sslscan reports OpenSSL names like
 #   ECDHE-RSA-AES128-SHA  or  AES256-SHA256
@@ -349,23 +371,40 @@ class PortResult:
                 out[label] += 1
         return out
 
-    def has_findings(self) -> bool:
-        base = (
-            bool(self.weak_protocols())
-            or bool(self.weak_ciphers())
-            or bool(self.cert.weaknesses())
-            or bool(self.heartbleed_vulnerable)
-            or self.compression_supported == "1"
-            or (self.renegotiation_supported == "1" and self.renegotiation_secure == "0")
-        )
-        if base:
-            return True
-        if STRICT_PQ and not self.pq_kex_supported():
-            return True
+    def finding_tags(self) -> set[str]:
+        """Every finding tag present on this port (see KNOWN_FINDING_TAGS).
+
+        Gate tags (NO-PQ, NO-PQ-HYBRID, BELOW-MIN-SCORE) are only produced
+        when the corresponding gate is active — either via its dedicated flag
+        or by being named in --fail-on — so that default runs are unchanged."""
+        tags: set[str] = set()
+        if self.weak_protocols():
+            tags.add("WEAK-PROTOCOL")
+        for _c, weaknesses in self.weak_ciphers():
+            tags.update(weaknesses)
+        tags.update(self.cert.weaknesses())
+        if self.heartbleed_vulnerable:
+            tags.add("HEARTBLEED")
+        if self.compression_supported == "1":
+            tags.add("TLS-COMPRESSION")
+        if self.renegotiation_supported == "1" and self.renegotiation_secure == "0":
+            tags.add("INSECURE-RENEG")
+        fail_on = FAIL_ON or frozenset()
+        if (STRICT_PQ or "NO-PQ" in fail_on) and not self.pq_kex_supported():
+            tags.add("NO-PQ")
+        if ((STRICT_PQ_HYBRID or "NO-PQ-HYBRID" in fail_on)
+                and self.pq_kex_kind() != "hybrid"):
+            tags.add("NO-PQ-HYBRID")
         if MIN_SCORE_RANK is not None and self.overall_strength():
             if _strength_rank(self.overall_strength()) < MIN_SCORE_RANK:
-                return True
-        return False
+                tags.add("BELOW-MIN-SCORE")
+        return tags
+
+    def has_findings(self) -> bool:
+        tags = self.finding_tags()
+        if FAIL_ON is not None:
+            tags &= FAIL_ON
+        return bool(tags)
 
 
 @dataclass
@@ -433,20 +472,44 @@ def parse_args() -> argparse.Namespace:
                    help="Pass --iana-names to sslscan (RFC cipher names).")
     p.add_argument("--show-times", action="store_true",
                    help="Include handshake-time data (sslscan --show-times).")
+    p.add_argument("--ipv6", action="store_true",
+                   help="Also resolve AAAA records and scan the resulting IPv6 "
+                        "addresses (requires IPv6 connectivity from the "
+                        "scanning host). Bare IPv6 literals given via --host "
+                        "or --cidr are always scanned regardless of this flag.")
     p.add_argument("--strict-pq", action="store_true",
                    help="Treat endpoints without any post-quantum key-exchange "
                         "group as findings (exit non-zero, sort to top of "
                         "endpoint details, count in flagged total). Use this in "
                         "CI to enforce PQ readiness across a fleet.")
+    p.add_argument("--strict-pq-hybrid", action="store_true",
+                   help="Like --strict-pq, but require a hybrid (PQ + classical) "
+                        "group specifically: endpoints offering only pure-PQ "
+                        "groups are also treated as findings.")
     p.add_argument("--min-score", metavar="LABEL",
                    choices=STRENGTH_BUCKETS, default=None,
                    help="Treat any endpoint whose overall sslscan strength score "
                         "is below this label as a finding (exit non-zero). "
                         f"Choices, worst→best: {', '.join(STRENGTH_BUCKETS)}. "
                         "Use this in CI as a fleet-wide minimum bar.")
+    p.add_argument("--fail-on", nargs="+", metavar="TAG", dest="fail_on",
+                   help="Restrict the exit-code gate to these finding tags "
+                        "(comma- or space-separated, case-insensitive). "
+                        "Reports still show every finding; only the named tags "
+                        "flag endpoints and drive exit code 1. Naming NO-PQ or "
+                        "NO-PQ-HYBRID activates that PQ gate implicitly. "
+                        f"Valid tags: {', '.join(sorted(KNOWN_FINDING_TAGS))}.")
+    p.add_argument("--baseline", metavar="FILE",
+                   help="Previous JSON report (--format json, script ≥ 0.5.0) "
+                        "to diff against: exit 1 only if an endpoint:port shows "
+                        "a finding tag absent from the baseline (a regression). "
+                        "Pre-existing findings are reported but don't fail the "
+                        "run.")
     p.add_argument("--format", nargs="+",
-                   choices=["md", "csv", "json", "html"], default=["md"],
-                   help="One or more output formats.")
+                   choices=["md", "csv", "json", "html", "sarif"], default=["md"],
+                   help="One or more output formats. 'sarif' emits SARIF 2.1.0 "
+                        "for ingestion by GitHub code scanning and similar "
+                        "dashboards.")
     p.add_argument("--output", metavar="STEM",
                    help="Output destination. With multiple --format values this is "
                         "used as a stem and extensions are appended.")
@@ -459,6 +522,14 @@ def parse_args() -> argparse.Namespace:
     if bad_ports:
         p.error(f"port(s) out of range 1-65535: {', '.join(map(str, bad_ports))}")
     args.ports = sorted(set(args.ports))
+    if args.fail_on:
+        tags = [t.strip().upper()
+                for item in args.fail_on for t in item.split(",") if t.strip()]
+        unknown = sorted(set(tags) - KNOWN_FINDING_TAGS)
+        if unknown:
+            p.error(f"unknown --fail-on tag(s): {', '.join(unknown)}. "
+                    f"Valid tags: {', '.join(sorted(KNOWN_FINDING_TAGS))}")
+        args.fail_on = sorted(set(tags))
     return args
 
 
@@ -505,10 +576,23 @@ def _resolve_a(domain: str, resolver: dns.resolver.Resolver) -> list[str]:
         return []
 
 
+def _resolve_aaaa(domain: str, resolver: dns.resolver.Resolver) -> list[str]:
+    try:
+        ans = resolver.resolve(domain, "AAAA")
+        return [str(rr) for rr in ans]
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers, dns.exception.Timeout) as exc:
+        # Plenty of hosts are IPv4-only; absence of AAAA is not noteworthy.
+        log.debug("DNS AAAA lookup failed for %s: %s", domain, exc)
+        return []
+
+
 def resolve_all_domains(domains: list[str],
+                        ipv6: bool = False,
                         workers: int = 10) -> dict[str, tuple[list[str], list[str]]]:
     """domain -> (cname_chain, [ip,...]).
 
+    With ipv6=True, AAAA records are appended after the A records.
     Resolution runs in a small thread pool: DNS round-trips dominate startup
     time for large target lists, and each lookup is independent."""
     out: dict[str, tuple[list[str], list[str]]] = {}
@@ -519,8 +603,11 @@ def resolve_all_domains(domains: list[str],
         resolver = dns.resolver.Resolver()
         chain = _resolve_cname_chain(d, resolver)
         ips = _resolve_a(d, resolver)
+        if ipv6:
+            ips += _resolve_aaaa(d, resolver)
         if not ips:
-            log.warning("No A records for %s — skipping", d)
+            log.warning("No %s records for %s — skipping",
+                        "A/AAAA" if ipv6 else "A", d)
         return chain, ips
 
     with ThreadPoolExecutor(max_workers=min(workers, len(domains))) as ex:
@@ -859,6 +946,62 @@ def run_all_jobs(
 
 
 # ---------------------------------------------------------------------------
+# Baseline / regression diffing
+# ---------------------------------------------------------------------------
+
+def load_baseline(path: str) -> dict[tuple[str, str, int], set[str]]:
+    """Parse a previous JSON report into {(target, ip, port): finding_tags}.
+
+    Requires a report produced by --format json with script ≥ 0.5.0 (the
+    first version that records per-port finding_tags); older reports can't
+    be diffed reliably, so we fail loudly rather than guess."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cannot read baseline {path!r}: {exc}") from exc
+    endpoints = doc.get("endpoints")
+    if not isinstance(endpoints, list):
+        raise RuntimeError(
+            f"Baseline {path!r} is not a sslscan_audit JSON report "
+            "(missing 'endpoints' array).")
+    out: dict[tuple[str, str, int], set[str]] = {}
+    for ep in endpoints:
+        for p in ep.get("ports", []):
+            if "finding_tags" not in p:
+                raise RuntimeError(
+                    f"Baseline {path!r} predates per-port finding_tags "
+                    "(script < 0.5.0) — regenerate it with --format json.")
+            out[(ep.get("target", ""), ep.get("ip", ""), p.get("port", 0))] = \
+                set(p["finding_tags"])
+    return out
+
+
+def diff_against_baseline(
+    baseline: dict[tuple[str, str, int], set[str]],
+    hosts: list["HostResult"],
+) -> list[tuple[str, str, int, list[str]]]:
+    """Return [(target, ip, port, [new_tags...])] for every reachable port
+    showing a finding tag not present in the baseline.  Endpoints absent
+    from the baseline count in full (every tag is new).  Findings that were
+    already in the baseline — or endpoints that disappeared — are not
+    regressions.  Respects --fail-on: filtered-out tags can't regress."""
+    regressions: list[tuple[str, str, int, list[str]]] = []
+    for h in sorted(hosts, key=lambda h: (h.target, h.ip)):
+        for port in sorted(h.ports):
+            pr = h.ports[port]
+            if not pr.reachable:
+                continue
+            now = pr.finding_tags()
+            if FAIL_ON is not None:
+                now &= FAIL_ON
+            new_tags = sorted(now - baseline.get((h.target, h.ip, port), set()))
+            if new_tags:
+                regressions.append((h.target, h.ip, port, new_tags))
+    return regressions
+
+
+# ---------------------------------------------------------------------------
 # Run metadata (for reproducibility)
 # ---------------------------------------------------------------------------
 
@@ -937,7 +1080,10 @@ def collect_run_metadata(
         sslscan_version=_sslscan_version(sslscan),
         gates={
             "strict_pq": STRICT_PQ,
+            "strict_pq_hybrid": STRICT_PQ_HYBRID,
             "min_score": gate_label,
+            "fail_on": sorted(FAIL_ON) if FAIL_ON is not None else None,
+            "baseline": getattr(args, "baseline", None),
         },
     )
 
@@ -1004,7 +1150,10 @@ def _md_section_run_metadata(meta: "RunMetadata") -> str:
         ("Working dir",     f"`{meta.cwd}`"),
         ("CI gates",
          f"strict_pq={meta.gates.get('strict_pq')}, "
-         f"min_score={meta.gates.get('min_score')}"),
+         f"strict_pq_hybrid={meta.gates.get('strict_pq_hybrid')}, "
+         f"min_score={meta.gates.get('min_score')}, "
+         f"fail_on={meta.gates.get('fail_on')}, "
+         f"baseline={meta.gates.get('baseline')}"),
     ]
     table = "\n".join(f"| {k} | {v} |" for k, v in rows)
     args_lines = "\n".join(
@@ -1178,6 +1327,8 @@ def _md_section_summary(args, scan_date, dom_count, cidr_count,
     strict_note_parts = []
     if STRICT_PQ:
         strict_note_parts.append("strict-pq")
+    if STRICT_PQ_HYBRID:
+        strict_note_parts.append("strict-pq-hybrid")
     if MIN_SCORE_RANK is not None:
         # Find label name for the rank
         rank_label = next(
@@ -1185,6 +1336,8 @@ def _md_section_summary(args, scan_date, dom_count, cidr_count,
             "?",
         )
         strict_note_parts.append(f"min-score≥{rank_label}")
+    if FAIL_ON is not None:
+        strict_note_parts.append(f"fail-on={','.join(sorted(FAIL_ON))}")
     strict_note = (
         f" _(gates active: {', '.join(strict_note_parts)})_"
         if strict_note_parts else ""
@@ -1203,7 +1356,9 @@ def _md_section_summary(args, scan_date, dom_count, cidr_count,
         f"| Ports scanned | {', '.join(str(p) for p in sorted(args.ports))} |",
         f"| Parallel workers | {args.workers} |",
         f"| Strict PQ mode | {'enabled' if STRICT_PQ else 'disabled'} |",
+        f"| Strict PQ-hybrid mode | {'enabled' if STRICT_PQ_HYBRID else 'disabled'} |",
         f"| Minimum sslscan score gate | {min_score_row_value} |",
+        f"| Fail-on filter | {', '.join(sorted(FAIL_ON)) if FAIL_ON is not None else 'disabled'} |",
         f"| Endpoints with at least one reachable TLS port | {len(reachable)} |",
         f"| Endpoints with findings{strict_note} | {len(flagged)} |",
         f"| sslscan overall-strength distribution (worst-of per port) | {strength_summary} |",
@@ -1411,9 +1566,12 @@ def _md_section_details(reachable: list[HostResult]) -> str:
             pq_kind = pr.pq_kex_kind()
             pq_label = {
                 "hybrid":  "🟢 hybrid (PQ + classical)",
-                "pure-pq": "🟡 pure post-quantum (no classical hybrid)",
+                "pure-pq": "🟡 pure post-quantum (no classical hybrid)"
+                           + (" (flagged by --strict-pq-hybrid)"
+                              if STRICT_PQ_HYBRID else ""),
                 "none":    "🔴 **none** — vulnerable to harvest-now-decrypt-later"
-                           + (" (flagged by --strict-pq)" if STRICT_PQ else ""),
+                           + (" (flagged by --strict-pq)"
+                              if STRICT_PQ or STRICT_PQ_HYBRID else ""),
             }[pq_kind]
             pq_names = ", ".join(f"`{g.name}`" for g in pr.pq_groups()) or "—"
             lines.append(f"| Post-Quantum KEX | {pq_label} |")
@@ -1512,7 +1670,7 @@ CSV_FIELDS = [
     "cert_issues", "cert_not_after", "cert_expired",
     "heartbleed", "reneg_supported", "reneg_secure",
     "compression", "fallback_scsv",
-    "pq_kex_kind", "pq_groups",
+    "pq_kex_kind", "pq_groups", "finding_tags",
     "sslscan_overall_strength", "sslscan_worst_cipher", "sslscan_worst_group",
 ]
 
@@ -1572,6 +1730,7 @@ def render_csv(hosts: list[HostResult],
                 "compression": pr.compression_supported,
                 "fallback_scsv": pr.fallback_supported,
                 "pq_kex_kind": pq_kind, "pq_groups": _csv_safe(pq_names),
+                "finding_tags": "|".join(sorted(pr.finding_tags())),
                 "sslscan_overall_strength": score_overall,
                 "sslscan_worst_cipher": score_cipher,
                 "sslscan_worst_group": score_group,
@@ -1650,6 +1809,8 @@ def render_json(
             host_doc["ports"].append({
                 "port": port,
                 "reachable": pr.reachable,
+                "has_findings": pr.has_findings(),
+                "finding_tags": sorted(pr.finding_tags()),
                 "protocols": pr.protocols,
                 "ciphers": [
                     {**asdict(c), "issues": c.weaknesses()} for c in pr.ciphers
@@ -1682,6 +1843,144 @@ def render_json(
                 "error": pr.error,
             })
         doc["endpoints"].append(host_doc)
+    return json.dumps(doc, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Reporting — SARIF 2.1.0 (GitHub code scanning et al.)
+# ---------------------------------------------------------------------------
+
+# tag → (SARIF level, short description, full description)
+SARIF_RULE_META: dict[str, tuple[str, str, str]] = {
+    "WEAK-PROTOCOL": ("error", "Legacy SSL/TLS protocol enabled",
+        "SSLv2, SSLv3, TLS 1.0 and TLS 1.1 are formally deprecated (RFC 8996) "
+        "and prohibited by PCI-DSS, NIST SP 800-52r2 and BSI TR-02102."),
+    "NULL": ("error", "NULL cipher suite accepted",
+        "NULL ciphers provide no confidentiality at all."),
+    "ANON": ("error", "Anonymous key exchange accepted",
+        "ADH/AECDH suites provide no server authentication and are trivially "
+        "MITM-able."),
+    "EXPORT": ("error", "EXPORT-grade cipher accepted",
+        "40/56-bit export ciphers are breakable in real time (FREAK, Logjam)."),
+    "DES/3DES": ("error", "DES/3DES cipher accepted",
+        "56/112-bit effective strength; Sweet32 birthday attack "
+        "(CVE-2016-2183)."),
+    "RC4": ("error", "RC4 cipher accepted",
+        "Statistical biases break confidentiality; prohibited by RFC 7465."),
+    "SHA1-MAC": ("error", "SHA-1 MAC cipher suite accepted",
+        "SHA-1 collisions are practical (SHAttered 2017, Shambles 2020)."),
+    "CBC-OLD-TLS": ("warning", "CBC cipher on TLS 1.0/1.1",
+        "BEAST and Lucky 13 padding-oracle exposure on legacy TLS."),
+    "NO-PFS": ("warning", "Cipher without forward secrecy accepted",
+        "Static-RSA key exchange lets recorded traffic be decrypted "
+        "retrospectively if the server key is ever compromised."),
+    "EXPIRED": ("error", "Expired certificate",
+        "The presented certificate is past its notAfter date."),
+    "SHA1-SIGNATURE": ("error", "SHA-1-signed certificate",
+        "Collision attacks make forged SHA-1 certificates practical; "
+        "modern clients reject them."),
+    "MD5-SIGNATURE": ("error", "MD5-signed certificate",
+        "MD5 collisions have been used to forge CA certificates since 2008."),
+    "HEARTBLEED": ("error", "Heartbleed (CVE-2014-0160)",
+        "Vulnerable OpenSSL builds leak server memory, including private keys."),
+    "TLS-COMPRESSION": ("error", "TLS compression enabled",
+        "The CRIME attack (CVE-2012-4929) recovers session secrets."),
+    "INSECURE-RENEG": ("error", "Insecure renegotiation",
+        "CVE-2009-3555 allows MITM data injection during renegotiation."),
+    "NO-PQ": ("warning", "No post-quantum key exchange",
+        "No ML-KEM/Kyber group is offered; recorded traffic is exposed to "
+        "harvest-now-decrypt-later once a quantum computer exists."),
+    "NO-PQ-HYBRID": ("warning", "No hybrid post-quantum key exchange",
+        "No hybrid (PQ + classical) group is offered. Hybrids such as "
+        "X25519MLKEM768 are the recommended transition deployment."),
+    "BELOW-MIN-SCORE": ("warning", "sslscan strength below configured minimum",
+        "The endpoint's worst-of sslscan strength label is below the "
+        "--min-score gate configured for this run."),
+}
+
+
+def _sarif_detail(pr: PortResult, tag: str) -> str:
+    """Per-result context string appended to the SARIF message."""
+    if tag == "WEAK-PROTOCOL":
+        return "Enabled: " + ", ".join(sorted(pr.weak_protocols(),
+                                              key=_proto_sort_key)) + "."
+    affected = sorted({c.name for c, ws in pr.weak_ciphers() if tag in ws})
+    if affected:
+        return "Affected ciphers: " + ", ".join(affected) + "."
+    if tag == "EXPIRED" and pr.cert.not_after:
+        return f"Not valid after {pr.cert.not_after}."
+    if tag in ("SHA1-SIGNATURE", "MD5-SIGNATURE"):
+        return f"Signature algorithm: {pr.cert.signature_algorithm}."
+    if tag == "HEARTBLEED":
+        return "Vulnerable protocols: " + ", ".join(pr.heartbleed_vulnerable) + "."
+    if tag == "BELOW-MIN-SCORE":
+        return f"Overall strength: {pr.overall_strength()}."
+    return ""
+
+
+def render_sarif(hosts: list[HostResult],
+                 run_meta: "RunMetadata | None" = None) -> str:
+    """SARIF reports every finding tag regardless of --fail-on — it is a
+    record for dashboards, not an exit-code gate."""
+    results: list[dict] = []
+    used_tags: set[str] = set()
+    for h in sorted(hosts, key=lambda h: (h.target, h.ip)):
+        for port in sorted(h.ports):
+            pr = h.ports[port]
+            if not pr.reachable:
+                continue
+            for tag in sorted(pr.finding_tags()):
+                level, short, _full = SARIF_RULE_META.get(
+                    tag, ("warning", tag, ""))
+                used_tags.add(tag)
+                detail = _sarif_detail(pr, tag)
+                message = f"{h.target} ({h.ip}) port {port}: {short}."
+                if detail:
+                    message += f" {detail}"
+                results.append({
+                    "ruleId": tag,
+                    "level": level,
+                    "message": {"text": message},
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": f"tls://{h.target}:{port}"},
+                        },
+                        "logicalLocations": [{
+                            "name": f"{h.target}:{port}",
+                            "fullyQualifiedName": f"{h.target}/{h.ip}:{port}",
+                            "kind": "resource",
+                        }],
+                    }],
+                    "properties": {"target": h.target, "ip": h.ip, "port": port},
+                })
+    rules = [
+        {
+            "id": tag,
+            "shortDescription": {"text": SARIF_RULE_META[tag][1]},
+            "fullDescription": {"text": SARIF_RULE_META[tag][2]},
+            "defaultConfiguration": {"level": SARIF_RULE_META[tag][0]},
+        }
+        for tag in sorted(used_tags) if tag in SARIF_RULE_META
+    ]
+    run: dict = {
+        "tool": {
+            "driver": {
+                "name": "sslscan_audit",
+                "version": SCRIPT_VERSION,
+                "informationUri": "https://github.com/rbsec/sslscan",
+                "rules": rules,
+            },
+        },
+        "results": results,
+    }
+    if run_meta is not None:
+        run["properties"] = {"run_metadata": run_meta.as_dict()}
+    doc = {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/"
+                   "master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [run],
+    }
     return json.dumps(doc, indent=2)
 
 
@@ -2029,7 +2328,10 @@ def _html_section_run_metadata(meta: "RunMetadata") -> str:
         ("Working dir",    f"<code>{_html_escape(meta.cwd)}</code>"),
         ("CI gates",
          f"strict_pq=<code>{_html_escape(str(meta.gates.get('strict_pq')))}</code>, "
-         f"min_score=<code>{_html_escape(str(meta.gates.get('min_score')))}</code>"),
+         f"strict_pq_hybrid=<code>{_html_escape(str(meta.gates.get('strict_pq_hybrid')))}</code>, "
+         f"min_score=<code>{_html_escape(str(meta.gates.get('min_score')))}</code>, "
+         f"fail_on=<code>{_html_escape(str(meta.gates.get('fail_on')))}</code>, "
+         f"baseline=<code>{_html_escape(str(meta.gates.get('baseline')))}</code>"),
     ]
     table = "".join(
         f"<tr><th>{_html_escape(k)}</th><td>{v}</td></tr>" for k, v in rows
@@ -2117,9 +2419,13 @@ def _html_section_summary(args, scan_date, dom_count, cidr_count,
     gates: list[str] = []
     if STRICT_PQ:
         gates.append("strict-pq")
+    if STRICT_PQ_HYBRID:
+        gates.append("strict-pq-hybrid")
     if MIN_SCORE_RANK is not None:
         lbl = next((k for k, r in STRENGTH_ORDER.items() if r == MIN_SCORE_RANK), "?")
         gates.append(f"min-score≥{lbl}")
+    if FAIL_ON is not None:
+        gates.append(f"fail-on={','.join(sorted(FAIL_ON))}")
     gates_str = ", ".join(gates) if gates else "none"
     unresolved_str = ", ".join(f"<code>{_html_escape(d)}</code>" for d in unresolved) or "none"
 
@@ -2495,6 +2801,8 @@ def render_one(fmt, hosts, args, scan_date, domain_meta, domain_count,
                run_meta: "RunMetadata | None" = None) -> str:
     if fmt == "csv":
         return render_csv(hosts, run_meta=run_meta)
+    if fmt == "sarif":
+        return render_sarif(hosts, run_meta=run_meta)
     if fmt == "json":
         return render_json(hosts, args, scan_date, domain_meta, run_meta=run_meta)
     if fmt == "html":
@@ -2507,9 +2815,11 @@ def render_one(fmt, hosts, args, scan_date, domain_meta, domain_count,
 def main() -> int:
     args = parse_args()
 
-    global STRICT_PQ, MIN_SCORE_RANK
+    global STRICT_PQ, STRICT_PQ_HYBRID, MIN_SCORE_RANK, FAIL_ON
     STRICT_PQ = bool(args.strict_pq)
+    STRICT_PQ_HYBRID = bool(args.strict_pq_hybrid)
     MIN_SCORE_RANK = _strength_rank(args.min_score) if args.min_score else None
+    FAIL_ON = frozenset(args.fail_on) if args.fail_on else None
 
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(ColorFormatter(use_colour=sys.stderr.isatty()))
@@ -2523,9 +2833,18 @@ def main() -> int:
     if STRICT_PQ:
         log.info("Strict PQ mode: endpoints without post-quantum KEX will be "
                  "treated as findings")
+    if STRICT_PQ_HYBRID:
+        log.info("Strict PQ-hybrid mode: endpoints without a hybrid "
+                 "(PQ + classical) group will be treated as findings")
     if MIN_SCORE_RANK is not None:
         log.info("Min-score gate: endpoints scored below '%s' will be treated "
                  "as findings", args.min_score)
+    if FAIL_ON is not None:
+        log.info("Fail-on filter: only these tags flag endpoints: %s",
+                 ", ".join(sorted(FAIL_ON)))
+
+    # Load the baseline before scanning so a bad file fails fast.
+    baseline = load_baseline(args.baseline) if args.baseline else None
 
     # Provenance / reproducibility record — captured up-front, finalised
     # below after orchestration so duration_s is real.
@@ -2550,7 +2869,7 @@ def main() -> int:
     cidrs = list(dict.fromkeys(cli_cidrs + (args.cidr or [])))
 
     log.info("Resolving DNS for %d domain(s) …", len(domains))
-    domain_meta = resolve_all_domains(domains)
+    domain_meta = resolve_all_domains(domains, ipv6=args.ipv6)
 
     jobs = plan_jobs(
         sslscan, domains, cidrs, args.ports, domain_meta,
@@ -2571,6 +2890,20 @@ def main() -> int:
     run_meta.duration_s = (finished - started).total_seconds()
     log.info("Scan complete in %.1fs. %d endpoint(s) scanned, %d reachable, %d with findings.",
              run_meta.duration_s, len(hosts), n_reachable, n_flagged)
+
+    regressions = None
+    if baseline is not None:
+        regressions = diff_against_baseline(baseline, hosts)
+        if regressions:
+            log.warning("%d regression(s) versus baseline %s:",
+                        len(regressions), args.baseline)
+            for target, ip, port, tags in regressions:
+                log.warning("  %s (%s) port %d: new finding(s): %s",
+                            target, ip, port, ", ".join(tags))
+        else:
+            log.info("No regressions versus baseline %s "
+                     "(%d pre-existing finding endpoint(s) ignored).",
+                     args.baseline, n_flagged)
 
     formats: list[str] = args.format
     kwargs = dict(hosts=hosts, args=args, scan_date=scan_date,
@@ -2596,7 +2929,10 @@ def main() -> int:
             log.info("Wrote %s → %s", fmt.upper(), path)
 
     # Exit code: 0 clean, 1 findings present.  Execution errors raise and
-    # produce 2 via the wrapper below.
+    # produce 2 via the wrapper below.  With --baseline, only regressions
+    # versus the baseline fail the run.
+    if regressions is not None:
+        return 1 if regressions else 0
     return 1 if n_flagged > 0 else 0
 
 

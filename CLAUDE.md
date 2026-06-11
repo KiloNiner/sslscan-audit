@@ -34,7 +34,7 @@ All data is held in dataclasses (no ORM, no database):
 - `Cipher` — one accepted cipher suite; `weaknesses()` returns tags like `SHA1-MAC`, `NO-PFS`, `RC4`
 - `KexGroup` — one offered TLS key-exchange group; `is_pq()` / `is_hybrid_pq()` detect post-quantum groups
 - `Certificate` — parsed from sslscan's `<certificates>` XML element; `is_pq_signed()` detects ML-DSA/SLH-DSA/Falcon signatures; `weaknesses()` returns tags like `EXPIRED`, `SHA1-SIGNATURE`, `MD5-SIGNATURE`
-- `PortResult` — aggregates ciphers, groups, cert, and vulnerability flags for one `(host, port)` scan; `has_findings()` is the single truth for whether this port counts as a finding
+- `PortResult` — aggregates ciphers, groups, cert, and vulnerability flags for one `(host, port)` scan; `finding_tags()` returns the canonical tag set (see `KNOWN_FINDING_TAGS`) and `has_findings()` (tags filtered by `FAIL_ON`) is the single truth for whether this port counts as a finding
 - `HostResult` — aggregates `PortResult`s for one `(target, ip)` pair; `has_findings()` delegates to its ports
 - `Job` — holds the sslscan command list and metadata for one scan unit, created by `plan_jobs()`
 - `RunMetadata` — provenance record (timing, CLI args, sslscan version) embedded in every output format
@@ -43,13 +43,15 @@ All data is held in dataclasses (no ORM, no database):
 
 ```
 parse_args()
+  → load_baseline()                # only with --baseline; fails fast on bad files
   → load_domains() + split --host into domain/CIDR lists
-  → resolve_all_domains()          # DNS CNAME chains + A records (thread pool)
+  → resolve_all_domains()          # DNS CNAME chains + A (and AAAA with --ipv6) records (thread pool)
   → plan_jobs()                    # build one Job per (ip, port) pair
   → run_all_jobs()                 # ThreadPoolExecutor, runs sslscan --xml=-
       → parse_sslscan_xml()        # ElementTree, returns PortResult
-  → render_one() × N formats       # md / csv / json / html
-  → exit 0 (clean) / 1 (findings) / 2 (error or zero scannable targets) / 130 (SIGINT)
+  → diff_against_baseline()        # only with --baseline; regressions drive exit code
+  → render_one() × N formats       # md / csv / json / html / sarif
+  → exit 0 (clean) / 1 (findings, or regressions with --baseline) / 2 (error or zero scannable targets) / 130 (SIGINT)
 ```
 
 ### Key design decisions
@@ -58,7 +60,11 @@ parse_args()
 
 **STARTTLS auto-detection:** `STARTTLS_PORTS` maps port numbers to sslscan `--starttls-<proto>` flags. Ports absent from the map (443, 465, 993, …) are treated as implicit TLS.
 
-**Global mutable CI gates:** `STRICT_PQ` and `MIN_SCORE_RANK` are module-level globals set once in `main()`. They are read by `PortResult.has_findings()` and the Markdown/HTML renderers. Changing their values in tests requires direct assignment.
+**Global mutable CI gates:** `STRICT_PQ`, `STRICT_PQ_HYBRID`, `MIN_SCORE_RANK`, and `FAIL_ON` are module-level globals set once in `main()`. They are read by `PortResult.finding_tags()` / `has_findings()` and the Markdown/HTML renderers. Changing their values in tests requires direct assignment (the `_restore_gates` fixture snapshots and restores them). Gate tags (`NO-PQ`, `NO-PQ-HYBRID`, `BELOW-MIN-SCORE`) are only emitted when the corresponding gate is active — either via its flag or by being named in `--fail-on`.
+
+**Finding-tag taxonomy:** `KNOWN_FINDING_TAGS` is the canonical vocabulary shared by `--fail-on` validation, the JSON/CSV `finding_tags` fields, SARIF rule IDs (`SARIF_RULE_META`), and baseline diffing. Adding a new weakness check means adding its tag here and to `SARIF_RULE_META`.
+
+**Baseline diffing:** `load_baseline()` only accepts JSON reports that carry per-port `finding_tags` (script ≥ 0.5.0) and fails loudly otherwise. `diff_against_baseline()` treats unknown endpoints as fully new, ignores disappeared endpoints, and respects `FAIL_ON`.
 
 **Subprocess timeout:** `proc_timeout = socket_timeout * SUBPROC_TIMEOUT_FACTOR + 30` — a hard wall-clock limit passed to `subprocess.run(timeout=…)`. This prevents stalled sslscan processes from blocking the thread pool indefinitely.
 
@@ -72,7 +78,7 @@ parse_args()
 
 ### Output formats
 
-All four formats (`md`, `csv`, `json`, `html`) are dispatched through `render_one()`. With a single `--format` the result goes to `--output` or stdout. With multiple formats, `--output` is used as a filename stem and the extension is appended (e.g. `report.md`, `report.json`).
+All five formats (`md`, `csv`, `json`, `html`, `sarif`) are dispatched through `render_one()`. With a single `--format` the result goes to `--output` or stdout. With multiple formats, `--output` is used as a filename stem and the extension is appended (e.g. `report.md`, `report.json`). SARIF always reports every finding tag regardless of `--fail-on`.
 
 ### Tests
 
@@ -82,10 +88,14 @@ All four formats (`md`, `csv`, `json`, `html`) are dispatched through `render_on
 - `build_sslscan_cmd` flag construction
 - `--host` IP vs hostname classification
 - XML parsing (using embedded XML fixtures — no file I/O, no network)
-- Cipher weakness detection
+- Cipher weakness detection (OpenSSL and IANA names)
+- Certificate weakness detection (expiry, weak signature digests)
+- Finding tags and CI gates (`--fail-on`, `--strict-pq-hybrid`)
 - Post-quantum group/cert detection
 - Strength ranking and rollup
 - `plan_jobs` STARTTLS/SNI wiring
 - Markdown port heading format
+- SARIF structure and rule/result consistency
+- Baseline loading and regression diffing
 
 Integration tests (`TestLiveScan`) are automatically skipped unless `sslscan` is on PATH. All other tests run without any external binary.
