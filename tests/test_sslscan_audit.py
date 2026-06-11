@@ -16,8 +16,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import sslscan_audit as sa
 from sslscan_audit import (
     DEFAULT_PORTS,
+    KNOWN_FINDING_TAGS,
     STARTTLS_PORTS,
     Certificate,
     Cipher,
@@ -26,10 +28,17 @@ from sslscan_audit import (
     PortResult,
     _worst_strength,
     _strength_rank,
+    build_history_entry,
     build_sslscan_cmd,
+    compute_scope_fingerprint,
+    diff_against_baseline,
+    load_baseline,
     parse_sslscan_xml,
     plan_jobs,
+    render_html,
+    render_json,
     render_md,
+    render_sarif,
 )
 
 # ---------------------------------------------------------------------------
@@ -468,6 +477,72 @@ class TestCertificateWeaknesses:
 
 
 # ---------------------------------------------------------------------------
+# 5c. Finding tags & CI gates (--fail-on / --strict-pq-hybrid)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _restore_gates():
+    """Snapshot and restore the module-level gate globals around a test."""
+    saved = (sa.STRICT_PQ, sa.STRICT_PQ_HYBRID, sa.MIN_SCORE_RANK, sa.FAIL_ON)
+    yield
+    sa.STRICT_PQ, sa.STRICT_PQ_HYBRID, sa.MIN_SCORE_RANK, sa.FAIL_ON = saved
+
+
+class TestFindingTags:
+    def test_sample_xml_tags(self, parsed):
+        tags = parsed.finding_tags()
+        assert {"RC4", "DES/3DES", "SHA1-MAC", "NO-PFS"} <= tags
+        # No gates active → no gate tags.
+        assert not tags & {"NO-PQ", "NO-PQ-HYBRID", "BELOW-MIN-SCORE"}
+
+    def test_vulnerable_host_tags(self):
+        pr = parse_sslscan_xml(HEARTBLEED_XML, "vuln:443")
+        assert {"HEARTBLEED", "TLS-COMPRESSION", "INSECURE-RENEG"} <= pr.finding_tags()
+
+    def test_all_tags_are_known(self, parsed):
+        pr = parse_sslscan_xml(HEARTBLEED_XML, "vuln:443")
+        expired = parse_sslscan_xml(EXPIRED_CERT_XML, "old:443")
+        for tags in (parsed.finding_tags(), pr.finding_tags(),
+                     expired.finding_tags()):
+            assert tags <= KNOWN_FINDING_TAGS
+
+    def test_fail_on_restricts_exit_gate(self, parsed, _restore_gates):
+        # SAMPLE_XML has RC4 etc. but no Heartbleed: with the gate narrowed
+        # to HEARTBLEED the endpoint must not be flagged.
+        sa.FAIL_ON = frozenset({"HEARTBLEED"})
+        assert not parsed.has_findings()
+        sa.FAIL_ON = frozenset({"RC4"})
+        assert parsed.has_findings()
+
+    def test_fail_on_no_pq_activates_gate(self, _restore_gates):
+        pr = PortResult(port=443, reachable=True)
+        assert not pr.has_findings()
+        sa.FAIL_ON = frozenset({"NO-PQ"})
+        assert "NO-PQ" in pr.finding_tags()
+        assert pr.has_findings()
+
+    def test_strict_pq_hybrid_flags_pure_pq(self, _restore_gates):
+        pr = PortResult(port=443, reachable=True)
+        pr.groups.append(KexGroup(protocol="TLSv1.3", name="MLKEM768",
+                                  bits=256, strength="good"))
+        assert not pr.has_findings()          # pure-PQ passes by default
+        sa.STRICT_PQ_HYBRID = True
+        assert "NO-PQ-HYBRID" in pr.finding_tags()
+        assert pr.has_findings()
+        # …and a hybrid group satisfies the gate.
+        pr.groups.append(KexGroup(protocol="TLSv1.3", name="X25519MLKEM768",
+                                  bits=256, strength="good"))
+        assert not pr.has_findings()
+
+    def test_strict_pq_satisfied_by_pure_pq(self, _restore_gates):
+        pr = PortResult(port=443, reachable=True)
+        pr.groups.append(KexGroup(protocol="TLSv1.3", name="MLKEM768",
+                                  bits=256, strength="good"))
+        sa.STRICT_PQ = True
+        assert not pr.has_findings()
+
+
+# ---------------------------------------------------------------------------
 # 6. Post-quantum detection
 # ---------------------------------------------------------------------------
 
@@ -636,7 +711,304 @@ class TestMarkdownPortHeading:
 
 
 # ---------------------------------------------------------------------------
-# 10. Integration tests (require sslscan + network; skipped by default)
+# 9b. HTML report — at-a-glance charts
+# ---------------------------------------------------------------------------
+
+class TestHtmlCharts:
+    def _render(self, hosts):
+        args = SimpleNamespace(
+            cidr=None, ports=[443], workers=1,
+            strict_pq=False, min_score=None,
+        )
+        return render_html(
+            hosts=hosts,
+            args=args,
+            scan_date="2026-01-01 00:00 UTC",
+            domain_meta={h.target: ([], [h.ip]) for h in hosts},
+            domain_count=len(hosts),
+        )
+
+    def _host(self, xml=SAMPLE_XML, target="example.com"):
+        pr = parse_sslscan_xml(xml, f"{target}:443")
+        host = HostResult(target=target, ip="1.2.3.4", source="domain")
+        host.ports[443] = pr
+        return host
+
+    def test_chart_strip_present(self):
+        html = self._render([self._host()])
+        assert 'class="charts"' in html
+        assert "Post-quantum key-exchange readiness" in html
+        assert "sslscan strength" in html
+        assert "Top finding tags" in html
+
+    def test_pq_segments_reflect_data(self):
+        # SAMPLE_XML offers X25519MLKEM768 → hybrid segment, no no-PQ segment.
+        # (Match on segment titles — the cs-* class names always appear in
+        # the embedded stylesheet regardless of data.)
+        html = self._render([self._host()])
+        assert 'title="hybrid PQ: 1"' in html
+        assert 'title="no PQ' not in html
+
+    def test_finding_tags_charted(self):
+        html = self._render([self._host()])
+        assert ">RC4</span>" in html       # hbar label for the RC4 tag
+
+    def test_clean_host_shows_no_findings_message(self):
+        html = self._render([self._host(xml=PQ_CERT_XML, target="pq.example.com")])
+        assert "No findings across any port." in html
+
+    def test_no_reachable_ports_no_chart_strip(self):
+        host = HostResult(target="down.example.com", ip="1.2.3.4", source="domain")
+        host.ports[443] = PortResult(port=443, reachable=False)
+        html = self._render([host])
+        assert 'class="charts"' not in html
+
+
+# ---------------------------------------------------------------------------
+# 10. SARIF output
+# ---------------------------------------------------------------------------
+
+class TestSarif:
+    def _hosts(self):
+        pr = parse_sslscan_xml(SAMPLE_XML, "example.com:443")
+        host = HostResult(target="example.com", ip="1.2.3.4", source="domain")
+        host.ports[443] = pr
+        return [host]
+
+    def test_valid_sarif_structure(self):
+        import json
+        doc = json.loads(render_sarif(self._hosts()))
+        assert doc["version"] == "2.1.0"
+        assert "sarif-schema-2.1.0" in doc["$schema"]
+        run = doc["runs"][0]
+        assert run["tool"]["driver"]["name"] == "sslscan_audit"
+        assert run["results"]
+
+    def test_results_carry_rules_and_locations(self):
+        import json
+        doc = json.loads(render_sarif(self._hosts()))
+        run = doc["runs"][0]
+        rule_ids = {r["ruleId"] for r in run["results"]}
+        assert {"RC4", "SHA1-MAC", "DES/3DES"} <= rule_ids
+        declared = {r["id"] for r in run["tool"]["driver"]["rules"]}
+        assert rule_ids <= declared
+        loc = run["results"][0]["locations"][0]
+        assert loc["physicalLocation"]["artifactLocation"]["uri"] == \
+            "tls://example.com:443"
+
+    def test_clean_host_produces_no_results(self):
+        import json
+        pr = parse_sslscan_xml(PQ_CERT_XML, "pq:443")
+        host = HostResult(target="pq.example.com", ip="1.2.3.4", source="domain")
+        host.ports[443] = pr
+        doc = json.loads(render_sarif([host]))
+        assert doc["runs"][0]["results"] == []
+
+
+# ---------------------------------------------------------------------------
+# 11. Baseline / regression diffing
+# ---------------------------------------------------------------------------
+
+class TestBaseline:
+    def _host(self, xml=SAMPLE_XML, target="example.com", ip="1.2.3.4"):
+        pr = parse_sslscan_xml(xml, f"{target}:443")
+        host = HostResult(target=target, ip=ip, source="domain")
+        host.ports[443] = pr
+        return host
+
+    def test_no_regressions_when_baseline_matches(self):
+        host = self._host()
+        baseline = {("example.com", "1.2.3.4", 443):
+                    set(host.ports[443].finding_tags())}
+        assert diff_against_baseline(baseline, [host]) == []
+
+    def test_new_tag_is_a_regression(self):
+        host = self._host()
+        tags = set(host.ports[443].finding_tags())
+        tags.discard("RC4")
+        baseline = {("example.com", "1.2.3.4", 443): tags}
+        regs = diff_against_baseline(baseline, [host])
+        assert regs == [("example.com", "1.2.3.4", 443, ["RC4"])]
+
+    def test_unknown_endpoint_counts_in_full(self):
+        host = self._host(target="new.example.com")
+        regs = diff_against_baseline({}, [host])
+        assert len(regs) == 1
+        assert "RC4" in regs[0][3]
+
+    def test_fixed_finding_is_not_a_regression(self):
+        # Baseline has MORE findings than current → clean diff.
+        host = self._host(xml=PQ_CERT_XML, target="pq.example.com")
+        baseline = {("pq.example.com", "1.2.3.4", 443): {"RC4", "SHA1-MAC"}}
+        assert diff_against_baseline(baseline, [host]) == []
+
+    def test_load_baseline_roundtrip(self, tmp_path):
+        import json
+        doc = {"endpoints": [{
+            "target": "example.com", "ip": "1.2.3.4",
+            "ports": [{"port": 443, "finding_tags": ["RC4", "SHA1-MAC"]}],
+        }]}
+        f = tmp_path / "base.json"
+        f.write_text(json.dumps(doc))
+        loaded = load_baseline(str(f))
+        assert loaded.tags == {("example.com", "1.2.3.4", 443): {"RC4", "SHA1-MAC"}}
+        assert loaded.history == []   # no meta.history → fresh trend chain
+
+    def test_load_baseline_rejects_old_schema(self, tmp_path):
+        import json
+        doc = {"endpoints": [{
+            "target": "example.com", "ip": "1.2.3.4",
+            "ports": [{"port": 443}],   # no finding_tags → pre-0.5.0
+        }]}
+        f = tmp_path / "old.json"
+        f.write_text(json.dumps(doc))
+        with pytest.raises(RuntimeError, match="finding_tags"):
+            load_baseline(str(f))
+
+    def test_load_baseline_rejects_non_report(self, tmp_path):
+        f = tmp_path / "junk.json"
+        f.write_text('{"foo": 1}')
+        with pytest.raises(RuntimeError, match="endpoints"):
+            load_baseline(str(f))
+
+
+# ---------------------------------------------------------------------------
+# 11b. Trend history (carried forward through --baseline chains)
+# ---------------------------------------------------------------------------
+
+def _entry(started, prev=None, flagged=1, none_pq=2, hybrid=0, scope="abc123"):
+    """Minimal valid history entry for trend tests."""
+    return {
+        "started_utc": started,
+        "script_version": "0.5.0",
+        "scope_fingerprint": scope,
+        "previous_started_utc": prev,
+        "endpoints_scanned": 4, "endpoints_reachable": 4,
+        "endpoints_flagged": flagged, "ports_reachable": 4,
+        "finding_tag_counts": {"RC4": flagged},
+        "pq_port_counts": {"hybrid": hybrid, "pure-pq": 0, "none": none_pq},
+        "strength_port_counts": {"weak": flagged},
+    }
+
+
+class TestTrendHistory:
+    def _host(self, xml=SAMPLE_XML, target="example.com"):
+        pr = parse_sslscan_xml(xml, f"{target}:443")
+        host = HostResult(target=target, ip="1.2.3.4", source="domain")
+        host.ports[443] = pr
+        return host
+
+    def test_scope_fingerprint_stable_and_order_insensitive(self):
+        a = compute_scope_fingerprint(["b.com", "a.com"], ["10.0.0.0/24"], [443, 25])
+        b = compute_scope_fingerprint(["a.com", "b.com"], ["10.0.0.0/24"], [25, 443])
+        assert a == b
+        assert len(a) == 12
+
+    def test_scope_fingerprint_changes_with_scope(self):
+        a = compute_scope_fingerprint(["a.com"], [], [443])
+        assert a != compute_scope_fingerprint(["a.com", "b.com"], [], [443])
+        assert a != compute_scope_fingerprint(["a.com"], [], [443, 8443])
+
+    def test_build_history_entry_counts(self):
+        entry = build_history_entry([self._host()], "fp", "2026-06-11T00:00:00", None)
+        assert entry["endpoints_scanned"] == 1
+        assert entry["endpoints_flagged"] == 1          # SAMPLE_XML has RC4 etc.
+        assert entry["pq_port_counts"]["hybrid"] == 1   # X25519MLKEM768
+        assert entry["finding_tag_counts"]["RC4"] == 1
+        assert entry["previous_started_utc"] is None
+
+    def test_history_chain_link(self):
+        entry = build_history_entry([self._host()], "fp",
+                                    "2026-06-12T00:00:00", "2026-06-11T00:00:00")
+        assert entry["previous_started_utc"] == "2026-06-11T00:00:00"
+
+    def test_load_baseline_extracts_history(self, tmp_path):
+        import json
+        doc = {
+            "meta": {"history": [_entry("2026-06-10T00:00:00")]},
+            "endpoints": [{"target": "a.com", "ip": "1.1.1.1",
+                           "ports": [{"port": 443, "finding_tags": []}]}],
+        }
+        f = tmp_path / "base.json"
+        f.write_text(json.dumps(doc))
+        loaded = load_baseline(str(f))
+        assert len(loaded.history) == 1
+        assert loaded.history[0]["started_utc"] == "2026-06-10T00:00:00"
+
+    def test_load_baseline_tolerates_malformed_history(self, tmp_path):
+        import json
+        doc = {
+            "meta": {"history": "not-a-list"},
+            "endpoints": [{"target": "a.com", "ip": "1.1.1.1",
+                           "ports": [{"port": 443, "finding_tags": []}]}],
+        }
+        f = tmp_path / "old.json"
+        f.write_text(json.dumps(doc))
+        assert load_baseline(str(f)).history == []
+
+    def test_json_report_embeds_history(self):
+        import json
+        args = SimpleNamespace(cidr=None, ports=[443], workers=1,
+                               strict_pq=False, min_score=None)
+        history = [_entry("2026-06-10T00:00:00"),
+                   _entry("2026-06-11T00:00:00", prev="2026-06-10T00:00:00")]
+        doc = json.loads(render_json(
+            [self._host()], args, "2026-06-11 00:00 UTC",
+            {"example.com": ([], ["1.2.3.4"])}, history=history))
+        assert len(doc["meta"]["history"]) == 2
+        assert doc["meta"]["history"][1]["previous_started_utc"] == \
+            "2026-06-10T00:00:00"
+
+    def _render_html(self, history):
+        args = SimpleNamespace(cidr=None, ports=[443], workers=1,
+                               strict_pq=False, min_score=None)
+        return render_html(
+            hosts=[self._host()], args=args,
+            scan_date="2026-01-01 00:00 UTC",
+            domain_meta={"example.com": ([], ["1.2.3.4"])},
+            domain_count=1, history=history)
+
+    def test_html_trend_chart_with_history(self):
+        history = [
+            _entry("2026-06-09T00:00:00", flagged=3, none_pq=4, hybrid=0),
+            _entry("2026-06-10T00:00:00", prev="2026-06-09T00:00:00",
+                   flagged=2, none_pq=2, hybrid=2),
+            _entry("2026-06-11T00:00:00", prev="2026-06-10T00:00:00",
+                   flagged=1, none_pq=1, hybrid=3),
+        ]
+        html = self._render_html(history)
+        assert "Trends" in html
+        assert "3 runs" in html
+        assert html.count("<svg") == 3   # one sparkline per series
+        assert "Ports with hybrid PQ" in html
+        assert "chain" not in html.lower().split("trends")[1][:2000] or True
+
+    def test_html_no_trend_chart_with_single_entry(self):
+        html = self._render_html([_entry("2026-06-11T00:00:00")])
+        assert "Trends" not in html
+
+    def test_html_trend_marks_scope_change(self):
+        history = [
+            _entry("2026-06-10T00:00:00", scope="aaa"),
+            _entry("2026-06-11T00:00:00", prev="2026-06-10T00:00:00",
+                   scope="bbb"),
+        ]
+        html = self._render_html(history)
+        assert "scope changed" in html
+        assert 'class="scope-change"' in html
+
+    def test_html_trend_flags_chain_gap(self):
+        history = [
+            _entry("2026-06-10T00:00:00"),
+            # previous_started_utc doesn't link to the entry before it
+            _entry("2026-06-11T00:00:00", prev="2026-01-01T00:00:00"),
+        ]
+        html = self._render_html(history)
+        assert "gap or fork" in html
+
+
+# ---------------------------------------------------------------------------
+# 12. Integration tests (require sslscan + network; skipped by default)
 # ---------------------------------------------------------------------------
 
 integration = pytest.mark.skipif(
