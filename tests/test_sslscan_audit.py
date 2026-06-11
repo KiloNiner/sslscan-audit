@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from sslscan_audit import (
     DEFAULT_PORTS,
     STARTTLS_PORTS,
+    Certificate,
     Cipher,
     HostResult,
     KexGroup,
@@ -227,6 +228,14 @@ class TestBuildSslscanCmd:
         assert "--xml=-" in cmd
         assert "--no-colour" in cmd
 
+    def test_ipv6_target_bracketed(self):
+        cmd = build_sslscan_cmd(
+            "sslscan", target_ip="2001:db8::1", port=443, sni=None,
+            connect_timeout=5, socket_timeout=5,
+            iana_names=False, show_times=False,
+        )
+        assert cmd[-1] == "[2001:db8::1]:443"
+
 
 # ---------------------------------------------------------------------------
 # 3. --host classification (IP vs hostname)
@@ -239,8 +248,8 @@ class TestHostClassification:
         domains, cidrs = [], []
         for h in hosts:
             try:
-                ipaddress.ip_address(h)
-                cidrs.append(f"{h}/32")
+                ip = ipaddress.ip_address(h)
+                cidrs.append(f"{h}/{ip.max_prefixlen}")
             except ValueError:
                 domains.append(h)
         return domains, cidrs
@@ -255,9 +264,10 @@ class TestHostClassification:
         assert domains == []
         assert cidrs == ["10.0.0.5/32"]
 
-    def test_ipv6_goes_to_cidr(self):
+    def test_ipv6_goes_to_cidr_as_single_address(self):
+        # /128, not /32 — an IPv6 /32 would expand to 2^96 hosts.
         domains, cidrs = self._classify(["::1"])
-        assert cidrs == ["::1/32"]
+        assert cidrs == ["::1/128"]
 
     def test_mixed_list_split_correctly(self):
         hosts = ["mail.example.com", "10.0.0.5", "smtp.example.com", "192.168.1.1"]
@@ -394,12 +404,67 @@ class TestWeaknessDetection:
                    cipher_id="0x1302", strength="strong")
         assert c.weaknesses() == []
 
+    # IANA (RFC) cipher names, as emitted under --iana-names, must be
+    # classified identically to OpenSSL names.
+    def test_iana_sha1_mac_flagged(self):
+        c = self._cipher("TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA")
+        assert "SHA1-MAC" in c.weaknesses()
+
+    def test_iana_static_rsa_no_pfs_flagged(self):
+        c = self._cipher("TLS_RSA_WITH_AES_128_GCM_SHA256")
+        assert "NO-PFS" in c.weaknesses()
+
+    def test_iana_tls13_suite_clean(self):
+        c = Cipher(status="preferred", protocol="TLSv1.3",
+                   name="TLS_AES_128_GCM_SHA256", bits=128,
+                   cipher_id="0x1301", strength="strong")
+        assert c.weaknesses() == []
+
     def test_weak_ciphers_detected_in_port_result(self, parsed):
         weak = parsed.weak_ciphers()
         names = [c.name for c, _ in weak]
         assert "RC4-SHA" in names
         assert "DES-CBC3-SHA" in names
         assert "TLS_AES_256_GCM_SHA384" not in names
+
+
+# ---------------------------------------------------------------------------
+# 5b. Certificate-level weakness detection
+# ---------------------------------------------------------------------------
+
+class TestCertificateWeaknesses:
+    def test_expired_cert_flagged(self):
+        assert "EXPIRED" in Certificate(expired="true").weaknesses()
+
+    def test_sha1_signature_flagged(self):
+        c = Certificate(signature_algorithm="sha1WithRSAEncryption")
+        assert "SHA1-SIGNATURE" in c.weaknesses()
+
+    def test_ecdsa_sha1_signature_flagged(self):
+        c = Certificate(signature_algorithm="ecdsa-with-SHA1")
+        assert "SHA1-SIGNATURE" in c.weaknesses()
+
+    def test_md5_signature_flagged(self):
+        c = Certificate(signature_algorithm="md5WithRSAEncryption")
+        assert "MD5-SIGNATURE" in c.weaknesses()
+
+    def test_sha256_signature_clean(self):
+        c = Certificate(signature_algorithm="sha256WithRSAEncryption",
+                        expired="false")
+        assert c.weaknesses() == []
+
+    def test_pq_signature_clean(self):
+        c = Certificate(signature_algorithm="ML-DSA-65", expired="false")
+        assert c.weaknesses() == []
+
+    def test_expired_sha1_cert_is_a_finding(self):
+        pr = parse_sslscan_xml(EXPIRED_CERT_XML, "old:443")
+        assert set(pr.cert.weaknesses()) == {"EXPIRED", "SHA1-SIGNATURE"}
+        assert pr.has_findings()
+
+    def test_clean_pq_endpoint_has_no_findings(self):
+        pr = parse_sslscan_xml(PQ_CERT_XML, "pq:443")
+        assert not pr.has_findings()
 
 
 # ---------------------------------------------------------------------------
