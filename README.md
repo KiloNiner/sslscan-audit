@@ -28,9 +28,56 @@ scraping of human-readable output), and produces a posture report covering:
 
 * Python 3.11 or newer
 * [`sslscan`](https://github.com/rbsec/sslscan) on `PATH`
-  (or pass `--sslscan-path`)
+  (or pass `--sslscan-path`) — **build it from source**, see below
 * [`dnspython`](https://pypi.org/project/dnspython/) (used to resolve domains
   and follow CNAME chains)
+
+### Building sslscan from source (strongly recommended)
+
+Distribution packages of [`sslscan`](https://github.com/rbsec/sslscan) are
+typically too old for this tool's purposes, in both directions:
+
+* **Post-quantum false negatives** — distro builds link the system OpenSSL,
+  which usually predates OpenSSL 3.5 (the first release with built-in
+  ML-KEM). Such a build can never negotiate `X25519MLKEM768` or the other
+  hybrid groups, so every endpoint reads as *no PQ support* regardless of
+  what the server actually offers.
+* **Legacy false negatives** — system OpenSSL is compiled with SSLv2/SSLv3,
+  EXPORT, and other weak ciphers removed. A scanner can only detect what its
+  own library can still speak, so servers that *do* accept those
+  "non-production" ciphers go unnoticed — exactly the findings an audit
+  exists to catch.
+
+Build the statically-linked variant instead, which compiles its own pinned
+OpenSSL with legacy protocols and weak/insecure ciphers *enabled for test
+purposes* (this is also the build the sslscan project itself recommends):
+
+```bash
+git clone https://github.com/rbsec/sslscan
+cd sslscan
+make static
+sudo install -m 0755 sslscan /usr/local/bin/sslscan
+# …or skip the install and point the audit at it directly:
+#   sslscan_audit.py --sslscan-path /path/to/sslscan/sslscan …
+```
+
+Version guidance:
+
+* sslscan ≥ 2.1 is required for key-exchange-group reporting (the `<group>`
+  XML elements this tool parses).
+* For ML-KEM hybrid detection, use a current release (≥ 2.2) so the bundled
+  OpenSSL is ≥ 3.5.
+
+To verify your build: `sslscan --version` should report a `-static` build
+and the bundled OpenSSL version (the audit records this banner in every
+report's run-metadata block, so reports are self-documenting). As a
+functional check, scan a known PQ-enabled endpoint and confirm the hybrid
+group shows up:
+
+```bash
+sslscan_audit.py --host cloudflare.com --ports 443 | grep -i mlkem
+```
+
 
 The script ships with [PEP 723](https://peps.python.org/pep-0723/) inline
 metadata and a `pipx run` shebang, so the simplest way to run it is:

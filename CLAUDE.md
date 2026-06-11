@@ -21,7 +21,7 @@ pytest tests/ -m "not integration"
 pytest tests/test_sslscan_audit.py::TestWeaknessDetection
 ```
 
-**Dependencies:** Python ≥ 3.11, `dnspython`, and `sslscan` binary on PATH (for running the tool; not required for unit tests).
+**Dependencies:** Python ≥ 3.11, `dnspython`, and `sslscan` binary on PATH (for running the tool; not required for unit tests). sslscan should be built from source with `make static` (see README): distro packages typically link an OpenSSL that is too old to negotiate ML-KEM hybrid groups and has legacy/weak ciphers compiled out, producing false negatives in both directions.
 
 ## Architecture
 
