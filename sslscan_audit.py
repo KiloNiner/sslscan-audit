@@ -709,6 +709,14 @@ def parse_sslscan_xml(xml_str: str, label: str) -> PortResult | None:
 
     test = root.find("ssltest")
     if test is None:
+        # sslscan ≥ 2.2 emits a valid document containing only an <error>
+        # element when it cannot connect — that's an unreachable port, not
+        # a parse failure.
+        err = root.find("error")
+        if err is not None:
+            msg = (err.text or "").strip()
+            log.debug("sslscan connect error for %s: %s", label, msg)
+            return PortResult(port=0, reachable=False, error=msg[:200])
         return None
 
     port = int(test.get("port", "0"))
@@ -1880,6 +1888,18 @@ def render_json(
         }
         for port in sorted(h.ports):
             pr = h.ports[port]
+            if not pr.reachable:
+                # Slim tombstone: every omitted field would be empty anyway,
+                # and CIDR sweeps are dominated by dead ports.  finding_tags
+                # stays — load_baseline() uses it as the ≥ 0.5.0 sentinel.
+                host_doc["ports"].append({
+                    "port": port,
+                    "reachable": False,
+                    "has_findings": pr.has_findings(),
+                    "finding_tags": sorted(pr.finding_tags()),
+                    "error": pr.error,
+                })
+                continue
             host_doc["ports"].append({
                 "port": port,
                 "reachable": pr.reachable,

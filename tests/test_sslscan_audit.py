@@ -359,6 +359,25 @@ class TestParseSslscanXml:
     def test_empty_xml_returns_none(self):
         assert parse_sslscan_xml("", "x:443") is None
 
+    def test_connect_error_document_is_unreachable(self):
+        # sslscan ≥ 2.2 emits a valid document with only an <error> element
+        # when the connection fails.
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<document title="SSLScan Results" version="2.2.2">\n'
+            '  <error><![CDATA[Could not open a connection to host 192.0.2.1 '
+            '(192.0.2.1) on port 443 (connect: Timed out).]]></error>\n'
+            '</document>'
+        )
+        pr = parse_sslscan_xml(xml, "192.0.2.1:443")
+        assert pr is not None
+        assert pr.reachable is False
+        assert "Could not open a connection" in pr.error
+
+    def test_document_without_ssltest_or_error_returns_none(self):
+        xml = '<document title="SSLScan Results" version="2.2.2"></document>'
+        assert parse_sslscan_xml(xml, "x:443") is None
+
 
 # ---------------------------------------------------------------------------
 # 5. Cipher weakness detection
@@ -1008,7 +1027,50 @@ class TestTrendHistory:
 
 
 # ---------------------------------------------------------------------------
-# 12. Integration tests (require sslscan + network; skipped by default)
+# 12. JSON renderer — port entry shapes
+# ---------------------------------------------------------------------------
+
+class TestJsonPortShapes:
+    def _host(self):
+        host = HostResult(target="example.com", ip="1.2.3.4", source="domain")
+        host.ports[443] = parse_sslscan_xml(SAMPLE_XML, "example.com:443")
+        host.ports[8443] = PortResult(port=8443, reachable=False,
+                                      error="connect: Timed out")
+        return host
+
+    def _render(self):
+        import json
+        args = SimpleNamespace(cidr=None, ports=[443, 8443], workers=1,
+                               strict_pq=False, min_score=None)
+        return json.loads(render_json(
+            [self._host()], args, "2026-06-12 00:00 UTC",
+            {"example.com": ([], ["1.2.3.4"])}))
+
+    def test_unreachable_port_is_slim(self):
+        ports = {p["port"]: p for p in self._render()["endpoints"][0]["ports"]}
+        assert set(ports[8443]) == {"port", "reachable", "has_findings",
+                                    "finding_tags", "error"}
+        assert ports[8443]["reachable"] is False
+        assert ports[8443]["error"] == "connect: Timed out"
+
+    def test_reachable_port_keeps_full_shape(self):
+        ports = {p["port"]: p for p in self._render()["endpoints"][0]["ports"]}
+        assert ports[443]["reachable"] is True
+        for key in ("protocols", "ciphers", "groups", "post_quantum",
+                    "sslscan_score", "certificate"):
+            assert key in ports[443]
+
+    def test_slim_report_loads_as_baseline(self, tmp_path):
+        import json
+        f = tmp_path / "report.json"
+        f.write_text(json.dumps(self._render()))
+        baseline = load_baseline(str(f))
+        assert ("example.com", "1.2.3.4", 8443) in baseline.tags
+        assert baseline.tags[("example.com", "1.2.3.4", 8443)] == set()
+
+
+# ---------------------------------------------------------------------------
+# 13. Integration tests (require sslscan + network; skipped by default)
 # ---------------------------------------------------------------------------
 
 integration = pytest.mark.skipif(
