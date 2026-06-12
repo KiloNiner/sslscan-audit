@@ -72,6 +72,8 @@ parse_args()
 
 **Strength rollup:** `PortResult.overall_strength()` returns the *worst* sslscan strength label across all ciphers and groups for that port. Unknown labels rank below `null` (rank −1) so they never accidentally upgrade a suspicious result.
 
+**Slim JSON entries for unreachable ports:** the JSON renderer emits only `port`, `reachable`, `has_findings`, `finding_tags`, `error` when `reachable` is false — CIDR sweeps are dominated by dead ports, and the full shape would be ~40 keys of empty scaffolding per entry (and misleading to consumers filtering on e.g. `certificate.expired`). `reachable` is the shape discriminator; `finding_tags` is always present because `load_baseline()` uses it as the ≥ 0.5.0 sentinel.
+
 **CSV formula injection guard:** `_csv_safe()` prefixes values starting with `=`, `+`, `-`, `@`, tab, or CR with a single quote, protecting against spreadsheet formula injection.
 
 **CSV reproducibility header:** The CSV preamble uses `#`-prefixed comment lines (pandas-compatible via `read_csv(comment="#")`) so run metadata is machine-readable even in flat-file consumers.
