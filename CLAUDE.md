@@ -70,6 +70,8 @@ parse_args()
 
 **Subprocess timeout:** `proc_timeout = socket_timeout * SUBPROC_TIMEOUT_FACTOR + 30` — a hard wall-clock limit passed to `subprocess.run(timeout=…)`. This prevents stalled sslscan processes from blocking the thread pool indefinitely.
 
+**On-demand progress:** `run_all_jobs()` registers `report_progress()` on `SIGINFO` (BSD/macOS `Ctrl-T` convention, absent on Linux/Windows) and `SIGUSR1` (Linux/macOS, absent on Windows) — whichever exist on the platform via `getattr(signal, ..., None)`. The closure reads `completed`/`total` from the enclosing scope, so it stays in sync without extra locking (only ever read, never written, from the handler). Previous handlers are restored in a `finally` block so the registration doesn't leak past a single `run_all_jobs()` call.
+
 **Strength rollup:** `PortResult.overall_strength()` returns the *worst* sslscan strength label across all ciphers and groups for that port. Unknown labels rank below `null` (rank −1) so they never accidentally upgrade a suspicious result.
 
 **Slim JSON entries for unreachable ports:** the JSON renderer emits only `port`, `reachable`, `has_findings`, `finding_tags`, `error` when `reachable` is false — CIDR sweeps are dominated by dead ports, and the full shape would be ~40 keys of empty scaffolding per entry (and misleading to consumers filtering on e.g. `certificate.expired`). `reachable` is the shape discriminator; `finding_tags` is always present because `load_baseline()` uses it as the ≥ 0.5.0 sentinel.

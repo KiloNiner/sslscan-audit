@@ -43,6 +43,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -920,42 +921,63 @@ def run_all_jobs(
     milestone = max(1, total // 20)
     completed = 0
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        future_to_job = {
-            ex.submit(run_sslscan, j.cmd, j.label, j.proc_timeout): j
-            for j in jobs
-        }
-        for fut in as_completed(future_to_job):
-            j = future_to_job[fut]
-            completed += 1
-            xml_str = fut.result()
-            key = (j.target, j.ip)
-            host = results.get(key)
-            if host is None:
-                cname, ips = ([], [])
-                if j.source == "domain":
-                    cname, ips = domain_meta.get(j.target, ([], []))
-                host = HostResult(
-                    target=j.target, ip=j.ip, source=j.source,
-                    cname_chain=cname, resolved_ips=ips,
-                )
-                results[key] = host
+    def report_progress(signum, frame):
+        log.info("Progress (on demand): %d/%d (%d%%)", completed, total,
+                  100 * completed // total)
 
-            if xml_str:
-                pr = parse_sslscan_xml(xml_str, j.label)
-                if pr is not None:
-                    pr.port = j.port  # in case XML lacked it
-                    host.ports[j.port] = pr
+    # SIGINFO (Ctrl-T) is the BSD/macOS convention for on-demand progress;
+    # it doesn't exist on Linux/Windows, so SIGUSR1 (`kill -USR1 <pid>`)
+    # covers those. signal.signal() only works from the main thread, so
+    # skip silently if we're not in it (e.g. embedded in another program).
+    on_demand_signals = [s for s in (getattr(signal, "SIGINFO", None),
+                                      getattr(signal, "SIGUSR1", None)) if s is not None]
+    prev_handlers: dict[int, object] = {}
+    for sig in on_demand_signals:
+        try:
+            prev_handlers[sig] = signal.signal(sig, report_progress)
+        except (ValueError, OSError):
+            pass
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            future_to_job = {
+                ex.submit(run_sslscan, j.cmd, j.label, j.proc_timeout): j
+                for j in jobs
+            }
+            for fut in as_completed(future_to_job):
+                j = future_to_job[fut]
+                completed += 1
+                xml_str = fut.result()
+                key = (j.target, j.ip)
+                host = results.get(key)
+                if host is None:
+                    cname, ips = ([], [])
+                    if j.source == "domain":
+                        cname, ips = domain_meta.get(j.target, ([], []))
+                    host = HostResult(
+                        target=j.target, ip=j.ip, source=j.source,
+                        cname_chain=cname, resolved_ips=ips,
+                    )
+                    results[key] = host
+
+                if xml_str:
+                    pr = parse_sslscan_xml(xml_str, j.label)
+                    if pr is not None:
+                        pr.port = j.port  # in case XML lacked it
+                        host.ports[j.port] = pr
+                    else:
+                        host.ports[j.port] = PortResult(port=j.port, reachable=False,
+                                                        error="xml-parse-failed")
                 else:
-                    host.ports[j.port] = PortResult(port=j.port, reachable=False,
-                                                    error="xml-parse-failed")
-            else:
-                # Port not reachable or sslscan failed silently.
-                host.ports[j.port] = PortResult(port=j.port, reachable=False)
+                    # Port not reachable or sslscan failed silently.
+                    host.ports[j.port] = PortResult(port=j.port, reachable=False)
 
-            if completed % milestone == 0 or completed == total:
-                log.info("Progress: %d/%d (%d%%)", completed, total,
-                         100 * completed // total)
+                if completed % milestone == 0 or completed == total:
+                    log.info("Progress: %d/%d (%d%%)", completed, total,
+                             100 * completed // total)
+    finally:
+        for sig, handler in prev_handlers.items():
+            signal.signal(sig, handler)
 
     return results
 
