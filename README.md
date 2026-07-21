@@ -137,6 +137,11 @@ Any other port (443, 465, 993, …) is treated as direct / implicit TLS.
 | `--iana-names` | off | Pass `--iana-names` to sslscan so cipher suites are reported using RFC names (`TLS_AES_128_GCM_SHA256`) instead of OpenSSL names (`AES128-GCM-SHA256`). |
 | `--show-times` | off | Include per-handshake timing data (`sslscan --show-times`). |
 
+On a large `--cidr` sweep, progress is logged automatically every 5%. To
+check in sooner, send the process an on-demand progress signal: `Ctrl-T`
+on macOS/BSD (the `SIGINFO` convention used by `dd`, `cp`, etc.), or
+`kill -USR1 <pid>` on Linux. Neither exists on Windows.
+
 ### CI gates
 
 These promote benign-looking configurations into findings so a CI run will

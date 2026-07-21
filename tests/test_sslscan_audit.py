@@ -7,8 +7,13 @@ Deps: pip install pytest dnspython
 from __future__ import annotations
 
 import ipaddress
+import logging
+import os
 import shutil
+import signal
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -693,6 +698,41 @@ class TestPlanJobs:
             iana_names=False, show_times=False,
         )
         assert jobs == []
+
+
+# ---------------------------------------------------------------------------
+# 8b. On-demand progress signal handler
+# ---------------------------------------------------------------------------
+
+class TestOnDemandProgress:
+    SIG = getattr(signal, "SIGUSR1", None)
+
+    @pytest.mark.skipif(SIG is None, reason="SIGUSR1 not available on this platform")
+    def test_signal_logs_progress_and_restores_handler(self, monkeypatch, caplog):
+        def slow_stub(cmd, label, timeout):
+            time.sleep(0.3)
+            return ""
+        monkeypatch.setattr(sa, "run_sslscan", slow_stub)
+
+        jobs = [
+            sa.Job(cmd=["sslscan"], label=f"h{i}:443", source="cidr",
+                   target=f"10.0.0.{i}", ip=f"10.0.0.{i}", port=443, proc_timeout=5)
+            for i in range(3)
+        ]
+
+        before_handler = signal.getsignal(self.SIG)
+
+        def fire():
+            time.sleep(0.1)
+            os.kill(os.getpid(), self.SIG)
+        threading.Thread(target=fire, daemon=True).start()
+
+        with caplog.at_level(logging.INFO, logger=sa.log.name):
+            sa.run_all_jobs(jobs, workers=3, domain_meta={})
+
+        assert any("Progress (on demand)" in r.message for r in caplog.records)
+        # The pre-existing handler must be restored once the run finishes.
+        assert signal.getsignal(self.SIG) == before_handler
 
 
 # ---------------------------------------------------------------------------
