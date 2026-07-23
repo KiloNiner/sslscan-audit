@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import html as _html
 import io
 import ipaddress
 import json
@@ -1197,6 +1198,20 @@ def _proto_sort_key(v: str) -> tuple[int, str]:
     return (order.get(v, 99), v)
 
 
+def _md_escape(s: str) -> str:
+    """Neutralize Markdown table/code-span syntax and raw HTML in values that
+    may reflect attacker-controlled data from a scanned TLS server (e.g.
+    certificate Subject/SAN/Issuer/signature-algorithm) — mirrors the
+    escaping render_html() already applies via _html_escape(). Without this,
+    a crafted cert field could close a code span or table cell and inject
+    live HTML into any Markdown-to-HTML pipeline that passes inline HTML
+    through unsanitized."""
+    if not s:
+        return s
+    s = s.replace("`", "'").replace("|", "\\|")
+    return _html.escape(s, quote=False)
+
+
 def _strength_badge(s: str) -> str:
     return {
         "strong":     "🟢 strong",
@@ -1517,7 +1532,7 @@ def _md_section_findings(reachable: list[HostResult]) -> str:
         lines.append("| Cipher Suite | Weakness | Occurrences |")
         lines.append("|---|---|---|")
         for (name, weakness), n in sorted(weak_cipher_count.items(), key=lambda x: -x[1]):
-            lines.append(f"| `{name}` | {weakness} | {n} |")
+            lines.append(f"| `{_md_escape(name)}` | {weakness} | {n} |")
     else:
         lines.append("_No weak cipher suites observed._")
     lines.append("")
@@ -1592,7 +1607,7 @@ def _md_section_findings(reachable: list[HostResult]) -> str:
         lines.append("| Group | Occurrences |")
         lines.append("|---|---|")
         for name, n in sorted(pq_group_count.items(), key=lambda x: -x[1]):
-            lines.append(f"| `{name}` | {n} |")
+            lines.append(f"| `{_md_escape(name)}` | {n} |")
         lines.append("")
     else:
         lines.append("_No post-quantum key-exchange groups observed across any "
@@ -1672,14 +1687,14 @@ def _md_section_details(reachable: list[HostResult]) -> str:
                            + (" (flagged by --strict-pq)"
                               if STRICT_PQ or STRICT_PQ_HYBRID else ""),
             }[pq_kind]
-            pq_names = ", ".join(f"`{g.name}`" for g in pr.pq_groups()) or "—"
+            pq_names = ", ".join(f"`{_md_escape(g.name)}`" for g in pr.pq_groups()) or "—"
             lines.append(f"| Post-Quantum KEX | {pq_label} |")
             lines.append(f"| PQ groups offered | {pq_names} |")
             cert_pq = pr.cert.is_pq_signed()
             cert_pq_label = (
-                f"🟢 **{pr.cert.signature_algorithm}**"
+                f"🟢 **{_md_escape(pr.cert.signature_algorithm)}**"
                 if cert_pq else
-                f"classical (`{pr.cert.signature_algorithm or 'unknown'}`)"
+                f"classical (`{_md_escape(pr.cert.signature_algorithm) or 'unknown'}`)"
             )
             lines.append(f"| Cert PQ signature | {cert_pq_label} |")
             # sslscan's own overall score for this port (worst-of cipher+group)
@@ -1705,7 +1720,7 @@ def _md_section_details(reachable: list[HostResult]) -> str:
                     if c.dhe_bits:   kx_parts.append(f"DHE-{c.dhe_bits}b")
                     kx = ", ".join(kx_parts) or "—"
                     issues = ", ".join(c.weaknesses()) or "—"
-                    cell_name = f"**`{c.name}`**" if issues != "—" else f"`{c.name}`"
+                    cell_name = f"**`{_md_escape(c.name)}`**" if issues != "—" else f"`{_md_escape(c.name)}`"
                     lines.append(
                         f"| {c.protocol} | {cell_name} | {c.bits} | {kx} "
                         f"| {_strength_badge(c.strength)} | {issues} |"
@@ -1724,7 +1739,7 @@ def _md_section_details(reachable: list[HostResult]) -> str:
                         pq_cell = "🟡 pure-PQ"
                     else:
                         pq_cell = "—"
-                    name_cell = f"**`{g.name}`**" if g.is_pq() else f"`{g.name}`"
+                    name_cell = f"**`{_md_escape(g.name)}`**" if g.is_pq() else f"`{_md_escape(g.name)}`"
                     lines.append(
                         f"| {g.protocol} | {name_cell} | {g.bits} "
                         f"| {_strength_badge(g.strength)} | {pq_cell} |"
@@ -1737,13 +1752,13 @@ def _md_section_details(reachable: list[HostResult]) -> str:
                 lines.append("**Certificate**\n")
                 lines.append("| Field | Value |")
                 lines.append("|---|---|")
-                lines.append(f"| Subject | `{c.subject}` |")
+                lines.append(f"| Subject | `{_md_escape(c.subject)}` |")
                 if c.altnames:
-                    lines.append(f"| Subject Alt Names | `{c.altnames}` |")
-                lines.append(f"| Issuer | `{c.issuer}` |")
+                    lines.append(f"| Subject Alt Names | `{_md_escape(c.altnames)}` |")
+                lines.append(f"| Issuer | `{_md_escape(c.issuer)}` |")
                 sig_issues = [w for w in c.weaknesses() if w.endswith("-SIGNATURE")]
                 sig_mark = f" ⚠️ **{', '.join(sig_issues)}**" if sig_issues else ""
-                lines.append(f"| Signature algorithm | `{c.signature_algorithm}`{sig_mark} |")
+                lines.append(f"| Signature algorithm | `{_md_escape(c.signature_algorithm)}`{sig_mark} |")
                 pk_bits = f"{c.pk_bits}-bit" if c.pk_bits else ""
                 pk_curve = f" ({c.pk_curve})" if c.pk_curve else ""
                 lines.append(f"| Public key | {c.pk_type} {pk_bits}{pk_curve} |")
@@ -2142,8 +2157,6 @@ class ColorFormatter(logging.Formatter):
 # ---------------------------------------------------------------------------
 # Reporting — HTML
 # ---------------------------------------------------------------------------
-
-import html as _html
 
 HTML_CSS = """
 :root {
