@@ -431,6 +431,26 @@ class TestWeaknessDetection:
         c = self._cipher("ECDHE-RSA-AES128-CBC-SHA", protocol="TLSv1.2")
         assert "CBC-OLD-TLS" not in c.weaknesses()
 
+    def test_bare_aes_cbc_name_flagged_on_old_tls(self):
+        # OpenSSL's name for the static-RSA CBC suite has no leading dash
+        # before AES ("AES128-SHA", not "-AES128-") — the regex must not
+        # require one, or every legacy no-PFS CBC suite goes undetected.
+        c = self._cipher("AES128-SHA", protocol="TLSv1.0")
+        assert "CBC-OLD-TLS" in c.weaknesses()
+
+    def test_bare_aes256_sha256_cbc_name_flagged_on_old_tls(self):
+        c = self._cipher("AES256-SHA256", protocol="TLSv1.1")
+        assert "CBC-OLD-TLS" in c.weaknesses()
+
+    def test_bare_camellia_cbc_name_flagged_on_old_tls(self):
+        c = self._cipher("CAMELLIA128-SHA", protocol="TLSv1.0")
+        assert "CBC-OLD-TLS" in c.weaknesses()
+
+    def test_bare_aes_gcm_name_not_flagged_as_cbc(self):
+        # Same no-leading-dash shape, but GCM — must stay excluded.
+        c = self._cipher("AES128-GCM-SHA256", protocol="TLSv1.2")
+        assert "CBC-OLD-TLS" not in c.weaknesses()
+
     def test_clean_cipher_has_no_weaknesses(self):
         c = Cipher(status="preferred", protocol="TLSv1.3",
                    name="TLS_AES_256_GCM_SHA384", bits=256,

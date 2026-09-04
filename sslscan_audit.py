@@ -125,7 +125,7 @@ MAX_HISTORY_ENTRIES = 365
 #   ECDHE-RSA-AES128-SHA  or  AES256-SHA256
 # and (for TLS 1.3) IANA names like TLS_AES_128_GCM_SHA256.
 RE_SHA1   = re.compile(r"(?:_SHA$|-SHA$)")              # SHA-1 MAC
-RE_CBC    = re.compile(r"(?:-CBC-|_CBC_|-AES\d+-(?!GCM)|-CAMELLIA\d+-(?!GCM))")
+RE_CBC    = re.compile(r"(?:-CBC-|_CBC_|(?:^|-)AES\d+-(?!GCM)|(?:^|-)CAMELLIA\d+-(?!GCM))")
 RE_RC4    = re.compile(r"RC4", re.I)
 RE_DES    = re.compile(r"\bDES\b|3DES|DES-CBC3", re.I)
 RE_EXPORT = re.compile(r"EXP(?:ORT)?", re.I)
